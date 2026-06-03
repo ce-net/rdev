@@ -12,6 +12,10 @@
 //!   - `rdev/sync`   `{caps, path, data_hex}`     — write a file under the target's home.
 //!   - `rdev/delete` `{caps, path}`               — delete a file (idempotent).
 //!   - `rdev/exec`   `{caps, image, cmd, cwd}`    — run a command in a sandboxed container.
+//!   - `rdev/spawn`  `{caps, cmd, cwd}`           — start a HOST process (cwd confined to home).
+//!     DANGEROUS: spawns native code on the host, not sandboxed. Gated by the `spawn` ability,
+//!     which a cap must explicitly carry. This is what lets a node bring up a new CE node +
+//!     `rdev serve` on a target — the basis for self-replicating fleets (see the `replicator` app).
 //!
 //! ## Commands
 //!   - `rdev serve`                       — run the server (handles the actions above).
@@ -21,7 +25,9 @@
 //!   - `rdev watch <dir> <target:dir>`    — continuous 1:1 folder mirror (replaces the old `mirror`).
 //!
 //! A `target` is a config alias or a 64-hex node id; the capability comes from the alias's `cap`
-//! (or `--cap`). v0: revocation not consulted (relies on expiry); inbox is polled.
+//! (or `--cap`). `rdev serve` consults the node's on-chain revoked set (refreshed periodically) and
+//! denies revoked chains; `spawn` is gated by a `$RDEV_SPAWN_ALLOW` allowlist (default-deny) with a
+//! scrubbed environment. The inbox is polled.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -359,45 +365,159 @@ async fn serve(client: &CeClient) -> Result<()> {
     let host_hex = client.status().await?.node_id;
     let host_id: [u8; 32] = hex::decode(&host_hex).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| anyhow!("bad node id"))?;
     let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    println!("rdev serving as {}… (rdev/sync, rdev/delete, rdev/exec)", &host_hex[..16]);
+    // Accepted capability roots: chains rooted at any of these (or at this host's own key) are
+    // honored. Empty by default (only self-issued caps). An org/fleet sets a shared root here so
+    // a seed can delegate attenuated caps down a replication tree that every node accepts.
+    let roots = load_roots();
+    println!(
+        "rdev serving as {}… (rdev/sync, rdev/delete, rdev/exec, rdev/spawn) — {} configured root(s)",
+        &host_hex[..16],
+        roots.len()
+    );
 
     let mut seen: HashSet<u64> = HashSet::new();
+    // On-chain revoked (issuer, nonce) set, refreshed from the node every ~10s. A request whose
+    // capability chain names a revoked link is denied even before its expiry.
+    let mut revoked: HashSet<([u8; 32], u64)> = HashSet::new();
+    let mut tick: u32 = 0;
     loop {
+        if tick % 20 == 0 {
+            if let Ok(pairs) = client.revoked().await {
+                revoked = pairs
+                    .into_iter()
+                    .filter_map(|(issuer, nonce)| {
+                        hex::decode(&issuer)
+                            .ok()
+                            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+                            .map(|i| (i, nonce))
+                    })
+                    .collect();
+            }
+        }
+        tick = tick.wrapping_add(1);
         for m in client.messages().await.unwrap_or_default() {
             let Some(token) = m.reply_token else { continue };
             if !m.topic.starts_with("rdev/") || !seen.insert(token) {
                 continue;
             }
-            let resp = handle(&m.topic, &m.from, &m.payload_hex, &host_id, &home).await;
+            let resp = handle(&m.topic, &m.from, &m.payload_hex, &host_id, &roots, &revoked, &home).await;
             let _ = client.reply(token, &serde_json::to_vec(&resp).unwrap_or_default()).await;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
-async fn handle(topic: &str, from_hex: &str, payload_hex: &str, host_id: &[u8; 32], home: &Path) -> Resp {
-    match handle_inner(topic, from_hex, payload_hex, host_id, home).await {
+/// Load accepted capability root keys (64-hex node ids, one per line, `#` comments). Looked up at
+/// `$RDEV_ROOTS`, else `$CE_DATA_DIR/roots`, else `~/.local/share/ce/roots` — mirrors the node's
+/// `<data_dir>/roots`. A node opts into an org/fleet by listing that org's root key here.
+fn load_roots() -> Vec<[u8; 32]> {
+    let path = std::env::var_os("RDEV_ROOTS")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("CE_DATA_DIR").map(|d| PathBuf::from(d).join("roots")))
+        .unwrap_or_else(|| dirs_next::home_dir().unwrap_or_default().join(".local/share/ce/roots"));
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(|l| l.split('#').next().unwrap_or("").trim())
+        .filter(|l| !l.is_empty())
+        .filter_map(|h| hex::decode(h).ok().and_then(|b| b.try_into().ok()))
+        .collect()
+}
+
+async fn handle(topic: &str, from_hex: &str, payload_hex: &str, host_id: &[u8; 32], roots: &[[u8; 32]], revoked: &HashSet<([u8; 32], u64)>, home: &Path) -> Resp {
+    match handle_inner(topic, from_hex, payload_hex, host_id, roots, revoked, home).await {
         Ok(r) => r,
         Err(e) => Resp { ok: false, error: Some(e.to_string()), ..Default::default() },
     }
 }
 
-/// Verify the capability and dispatch the action. `now_secs` is injectable for tests.
-async fn handle_inner(topic: &str, from_hex: &str, payload_hex: &str, host_id: &[u8; 32], home: &Path) -> Result<Resp> {
+/// Verify the capability and dispatch the action.
+async fn handle_inner(topic: &str, from_hex: &str, payload_hex: &str, host_id: &[u8; 32], roots: &[[u8; 32]], revoked: &HashSet<([u8; 32], u64)>, home: &Path) -> Result<Resp> {
     let action = topic.strip_prefix("rdev/").unwrap_or(topic);
     let req: Req = serde_json::from_slice(&hex::decode(payload_hex).context("payload hex")?).context("payload json")?;
     let from: [u8; 32] = hex::decode(from_hex).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| anyhow!("bad sender id"))?;
 
-    // Authorize with the capability primitive. accepted_roots empty → self-issued caps honored;
-    // revocation not consulted in v0 (rely on expiry).
+    // Authorize with the capability primitive. Chains rooted at this host or any configured root
+    // are honored; a link named in the on-chain revoked set is rejected (consulted via the node).
     let chain: Vec<SignedCapability> = decode_chain(&req.caps).map_err(|_| anyhow!("bad capability"))?;
-    authorize(host_id, &[], &[], now(), &from, action, &chain, &|_, _| false).map_err(|e| anyhow!("denied: {e}"))?;
+    let is_revoked = |issuer: &[u8; 32], nonce: u64| revoked.contains(&(*issuer, nonce));
+    authorize(host_id, roots, &[], now(), &from, action, &chain, &is_revoked).map_err(|e| anyhow!("denied: {e}"))?;
 
     match action {
         "exec" => exec_action(&req, home).await,
+        "spawn" => spawn_action(&req, &chain, home),
         "sync" | "delete" => fs_action(action, &req, &chain, home),
         other => Err(anyhow!("unknown rdev action '{other}'")),
     }
+}
+
+/// Allowed program basenames for `rdev/spawn`, from `$RDEV_SPAWN_ALLOW` (comma-separated).
+/// EMPTY/unset ⇒ spawn is DENIED entirely (default-deny). The operator opts in explicitly, e.g.
+/// `RDEV_SPAWN_ALLOW=ce,rdev,replicator,sh`. This bounds the blast radius of the (unsandboxed)
+/// spawn ability: even a holder of a valid `spawn` cap can only launch programs on this list.
+fn spawn_allowlist() -> Vec<String> {
+    std::env::var("RDEV_SPAWN_ALLOW")
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Start a HOST process (NOT sandboxed). Reached only with the `spawn` ability, AND only for a
+/// program whose basename is on `$RDEV_SPAWN_ALLOW` (default-deny). `cwd` is confined to the
+/// target's home + any `path_prefix` caveat; the environment is scrubbed; the child is detached
+/// (stdio null) so long-running processes like `ce start` survive. Returns the spawned pid.
+fn spawn_action(req: &Req, chain: &[SignedCapability], home: &Path) -> Result<Resp> {
+    let cmd = req.cmd.clone().unwrap_or_default();
+    if cmd.is_empty() {
+        return Err(anyhow!("spawn needs a command"));
+    }
+    // Default-deny allowlist on the program basename.
+    let allow = spawn_allowlist();
+    let prog_base = std::path::Path::new(&cmd[0])
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| cmd[0].clone());
+    if allow.is_empty() {
+        return Err(anyhow!(
+            "spawn denied: no programs allow-listed (set RDEV_SPAWN_ALLOW=<basenames>)"
+        ));
+    }
+    if !allow.contains(&prog_base) {
+        return Err(anyhow!("spawn denied: '{prog_base}' not in RDEV_SPAWN_ALLOW {allow:?}"));
+    }
+    let cwd = match &req.cwd {
+        Some(c) => {
+            if c.contains("..") {
+                return Err(anyhow!("path traversal not allowed"));
+            }
+            if let Some(prefix) = chain.last().and_then(|c| c.cap.caveats.path_prefix.as_ref()) {
+                if !c.starts_with(prefix.as_str()) {
+                    return Err(anyhow!("cwd outside capability prefix '{prefix}'"));
+                }
+            }
+            home.join(c)
+        }
+        None => home.to_path_buf(),
+    };
+    std::fs::create_dir_all(&cwd).ok();
+    // Scrub the environment so the child can't inherit the server's secrets (tokens, keys, etc.).
+    // Provide only a minimal, safe set.
+    let path_env = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
+    let child = std::process::Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .current_dir(&cwd)
+        .env_clear()
+        .env("PATH", path_env)
+        .env("HOME", &cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawn '{}'", cmd[0]))?;
+    Ok(Resp { ok: true, stdout: Some(format!("spawned pid {}", child.id())), ..Default::default() })
 }
 
 async fn exec_action(req: &Req, home: &Path) -> Result<Resp> {
@@ -594,7 +714,7 @@ mod tests {
         let sender = id("h-ok-sender");
         let token = cap(&host, sender.node_id(), &["sync"], None, 0);
         let req = Req { caps: token, path: "f.txt".into(), data_hex: Some(hex::encode(b"data")), ..Default::default() };
-        let resp = handle_inner("rdev/sync", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &home).await.unwrap();
+        let resp = handle_inner("rdev/sync", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &[], &std::collections::HashSet::new(), &home).await.unwrap();
         assert!(resp.ok);
         assert_eq!(std::fs::read(home.join("f.txt")).unwrap(), b"data");
     }
@@ -607,7 +727,7 @@ mod tests {
         // cap grants only "sync"; request "delete"
         let token = cap(&host, sender.node_id(), &["sync"], None, 0);
         let req = Req { caps: token, path: "f.txt".into(), ..Default::default() };
-        let err = handle_inner("rdev/delete", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &home).await.unwrap_err();
+        let err = handle_inner("rdev/delete", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &[], &std::collections::HashSet::new(), &home).await.unwrap_err();
         assert!(err.to_string().contains("denied"));
     }
 
@@ -618,7 +738,7 @@ mod tests {
         let sender = id("h-exp-sender");
         let token = cap(&host, sender.node_id(), &["sync"], None, 1); // not_after = 1 (long past)
         let req = Req { caps: token, path: "f.txt".into(), data_hex: Some(hex::encode(b"z")), ..Default::default() };
-        let err = handle_inner("rdev/sync", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &home).await.unwrap_err();
+        let err = handle_inner("rdev/sync", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &[], &std::collections::HashSet::new(), &home).await.unwrap_err();
         assert!(err.to_string().contains("denied"));
     }
 
@@ -631,7 +751,7 @@ mod tests {
         // cap issued to `other`, presented by `sender`
         let token = cap(&host, other.node_id(), &["sync"], None, 0);
         let req = Req { caps: token, path: "f.txt".into(), data_hex: Some(hex::encode(b"z")), ..Default::default() };
-        let err = handle_inner("rdev/sync", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &home).await.unwrap_err();
+        let err = handle_inner("rdev/sync", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &[], &std::collections::HashSet::new(), &home).await.unwrap_err();
         assert!(err.to_string().contains("denied"));
     }
 
@@ -643,7 +763,118 @@ mod tests {
         let sender = id("h-root-sender");
         let token = cap(&stranger, sender.node_id(), &["sync"], None, 0);
         let req = Req { caps: token, path: "f.txt".into(), data_hex: Some(hex::encode(b"z")), ..Default::default() };
-        let err = handle_inner("rdev/sync", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &home).await.unwrap_err();
+        let err = handle_inner("rdev/sync", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &[], &std::collections::HashSet::new(), &home).await.unwrap_err();
         assert!(err.to_string().contains("denied"));
+    }
+
+    // ----- spawn: HOST process execution, gated by the `spawn` ability -----
+
+    /// Allow the programs the spawn tests launch (default-deny otherwise). Idempotent value so
+    /// concurrent tests setting the same env var don't disagree.
+    fn allow_spawn() {
+        unsafe { std::env::set_var("RDEV_SPAWN_ALLOW", "sh,true") };
+    }
+
+    #[tokio::test]
+    async fn spawn_authorized_runs_host_process() {
+        allow_spawn();
+        let home = tmp_home("spawn-ok");
+        let _ = std::fs::remove_file(home.join("spawned_marker"));
+        let host = id("spawn-ok-host");
+        let sender = id("spawn-ok-sender");
+        let token = cap(&host, sender.node_id(), &["spawn"], None, 0);
+        let req = Req { caps: token, cmd: Some(vec!["sh".into(), "-c".into(), "echo hi > spawned_marker".into()]), ..Default::default() };
+        let resp = handle_inner("rdev/spawn", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &[], &std::collections::HashSet::new(), &home).await.unwrap();
+        assert!(resp.ok);
+        assert!(resp.stdout.unwrap_or_default().contains("spawned pid"));
+        let marker = home.join("spawned_marker");
+        let mut ran = false;
+        for _ in 0..30 {
+            if marker.exists() { ran = true; break; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ran, "spawned host process did not create its marker");
+    }
+
+    #[tokio::test]
+    async fn spawn_denied_without_spawn_ability() {
+        let home = tmp_home("spawn-deny");
+        let host = id("spawn-deny-host");
+        let sender = id("spawn-deny-sender");
+        let token = cap(&host, sender.node_id(), &["sync"], None, 0); // no "spawn"
+        let req = Req { caps: token, cmd: Some(vec!["sh".into(), "-c".into(), "echo pwned > pwned".into()]), ..Default::default() };
+        let err = handle_inner("rdev/spawn", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &[], &std::collections::HashSet::new(), &home).await.unwrap_err();
+        assert!(err.to_string().contains("denied"));
+        assert!(!home.join("pwned").exists());
+    }
+
+    #[tokio::test]
+    async fn spawn_cwd_rejects_traversal() {
+        allow_spawn();
+        let home = tmp_home("spawn-trav");
+        let host = id("spawn-trav-host");
+        let sender = id("spawn-trav-sender");
+        let token = cap(&host, sender.node_id(), &["spawn"], None, 0);
+        let req = Req { caps: token, cmd: Some(vec!["true".into()]), cwd: Some("../evil".into()), ..Default::default() };
+        let err = handle_inner("rdev/spawn", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &[], &std::collections::HashSet::new(), &home).await.unwrap_err();
+        assert!(err.to_string().contains("traversal"));
+    }
+
+    #[tokio::test]
+    async fn spawn_denied_for_non_allowlisted_program() {
+        allow_spawn(); // allows sh,true — but NOT `echo`
+        let home = tmp_home("spawn-allow");
+        let host = id("spawn-allow-host");
+        let sender = id("spawn-allow-sender");
+        let token = cap(&host, sender.node_id(), &["spawn"], None, 0);
+        let req = Req { caps: token, cmd: Some(vec!["echo".into(), "hi".into()]), ..Default::default() };
+        let err = handle_inner("rdev/spawn", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &[], &std::collections::HashSet::new(), &home).await.unwrap_err();
+        assert!(err.to_string().contains("not in RDEV_SPAWN_ALLOW"), "got: {err}");
+    }
+
+    // ----- delegation rooted at a configured org root: the recursion spine -----
+
+    #[tokio::test]
+    async fn delegated_chain_rooted_at_org_root_authorizes() {
+        allow_spawn();
+        let home = tmp_home("deleg");
+        let _ = std::fs::remove_file(home.join("deleg_marker"));
+        let root = id("deleg-root"); // shared org root R, listed in the host's accepted roots
+        let seed = id("deleg-seed"); // A holds [R->A]
+        let mid = id("deleg-mid"); // B holds [R->A, A->B] (A delegated to B)
+        let host = id("deleg-host"); // C: serving host, accepts R as a root
+
+        let c0 = SignedCapability::issue(&root, seed.node_id(), vec!["sync".into(), "spawn".into()], Resource::Any, Caveats::default(), 1, None);
+        let c1 = SignedCapability::issue(&seed, mid.node_id(), vec!["spawn".into()], Resource::Any, Caveats::default(), 2, Some(c0.id()));
+        let token = encode_chain(&[c0, c1]);
+
+        // B presents the delegated chain to host C; requester = B. C honors it (rooted at R).
+        let req = Req { caps: token, cmd: Some(vec!["sh".into(), "-c".into(), "echo ok > deleg_marker".into()]), ..Default::default() };
+        let resp = handle_inner("rdev/spawn", &hex::encode(mid.node_id()), &payload(&req), &host.node_id(), &[root.node_id()], &std::collections::HashSet::new(), &home).await.unwrap();
+        assert!(resp.ok);
+        let marker = home.join("deleg_marker");
+        let mut ran = false;
+        for _ in 0..30 {
+            if marker.exists() { ran = true; break; }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ran, "delegated spawn did not run");
+    }
+
+    #[tokio::test]
+    async fn delegation_cannot_escalate_beyond_parent() {
+        let home = tmp_home("deleg-esc");
+        let root = id("esc-root");
+        let seed = id("esc-seed");
+        let mid = id("esc-mid");
+        let host = id("esc-host");
+        // R -> A grants ONLY sync; A tries to delegate `spawn` to B — privilege escalation.
+        let c0 = SignedCapability::issue(&root, seed.node_id(), vec!["sync".into()], Resource::Any, Caveats::default(), 1, None);
+        let c1 = SignedCapability::issue(&seed, mid.node_id(), vec!["spawn".into()], Resource::Any, Caveats::default(), 2, Some(c0.id()));
+        let token = encode_chain(&[c0, c1]);
+        let req = Req { caps: token, cmd: Some(vec!["sh".into(), "-c".into(), "echo pwn > pwn".into()]), ..Default::default() };
+        let err = handle_inner("rdev/spawn", &hex::encode(mid.node_id()), &payload(&req), &host.node_id(), &[root.node_id()], &std::collections::HashSet::new(), &home).await.unwrap_err();
+        assert!(err.to_string().contains("denied"));
+        assert!(!home.join("pwn").exists());
     }
 }

@@ -34,24 +34,27 @@ Client → target node, topic `rdev/<action>`, JSON payload; the target runs `rd
 |---|---|---|
 | `rdev/sync` | `{ caps, path, data_hex }` | write a file under the target's home |
 | `rdev/delete` | `{ caps, path }` | delete a file (idempotent) |
+| `rdev/exec` | `{ caps, image, cmd, cwd }` | run a command in a sandboxed container (gVisor, network off) |
+| `rdev/spawn` | `{ caps, cmd, cwd }` | **start a HOST process** (NOT sandboxed); `cwd` confined to home |
 
-## Roadmap — the rest of the extraction
+`rdev/spawn` is deliberately powerful — it runs native code on the host, which is what lets one node
+bring up a CE node + `rdev serve` on another (the basis for self-replicating fleets; see the
+`replicator` app). It is reachable only with the `spawn` ability, which a capability must carry
+explicitly. `rdev serve` honors chains rooted at this host **or** at any key in `$RDEV_ROOTS`
+(else `$CE_DATA_DIR/roots`, else `~/.local/share/ce/roots`) — a fleet shares one org root so a seed
+can delegate attenuated caps down a replication tree that every node accepts.
 
-This v0 proves the pattern with `sync`/`delete` (the `mirror` backend). The other former node
-features move here the same way, each gated on one thing:
+## Status
 
-- **`exec` / `deploy`** — identical pattern; the handler composes the **`ce-container`** primitive
-  (bollard/gVisor) + a job store. Straightforward follow-on.
-- **`tunnel`** — streaming, not request/response. Needs a CE node primitive that lets a *local app*
-  accept/open raw mesh streams (the stream control is currently node-internal). That primitive must
-  land in CE first; then `rdev tunnel` is a thin wrapper.
-- **Migration** — once proven on a live mesh, the node's `SyncFile`/`SyncDelete` RPCs (and
-  `mirror`'s use of them) repoint here, removing the duplicate from CE — the point of the exercise.
+`sync`, `delete`, `exec`, and `spawn` are implemented and tested — unit tests for the auth path
+(self-issued, delegated/org-root, expiry, audience, escalation) plus live mesh end-to-end runs
+(`~/ce-net/e2e-local.sh` for sync/delete, `~/ce-net/e2e-replicate.sh` for spawn + delegation).
+`tunnel` stays a CE primitive (`ce tunnel`) since it needs raw mesh streams, not request/response.
 
-## v0 limitations
+## Remaining refinements
 
 - Capability **revocation is not consulted** yet (relies on expiry). A node endpoint to query the
   on-chain revocation set would close this.
 - The inbox is **polled** (500 ms); switching to the SSE stream is a refinement.
-- Untested against a live two-node mesh — it compiles and the protocol is wired, but the end-to-end
-  path needs two running nodes to validate.
+- `sync` ships file bytes inline as `data_hex` in one `AppRequest` — fine for small files; large
+  binaries should move to `put_blob`/`get_object` (content-addressed, chunked).
