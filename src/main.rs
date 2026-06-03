@@ -114,7 +114,7 @@ struct Alias {
 }
 
 /// Wire request payload (fields used per action).
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct Req {
     caps: String,
     #[serde(default)]
@@ -129,7 +129,7 @@ struct Req {
     cwd: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 struct Resp {
     ok: bool,
     #[serde(default)]
@@ -358,6 +358,7 @@ fn skip(name: &str) -> bool {
 async fn serve(client: &CeClient) -> Result<()> {
     let host_hex = client.status().await?.node_id;
     let host_id: [u8; 32] = hex::decode(&host_hex).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| anyhow!("bad node id"))?;
+    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     println!("rdev serving as {}… (rdev/sync, rdev/delete, rdev/exec)", &host_hex[..16]);
 
     let mut seen: HashSet<u64> = HashSet::new();
@@ -367,21 +368,22 @@ async fn serve(client: &CeClient) -> Result<()> {
             if !m.topic.starts_with("rdev/") || !seen.insert(token) {
                 continue;
             }
-            let resp = handle(&m.topic, &m.from, &m.payload_hex, &host_id).await;
+            let resp = handle(&m.topic, &m.from, &m.payload_hex, &host_id, &home).await;
             let _ = client.reply(token, &serde_json::to_vec(&resp).unwrap_or_default()).await;
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
-async fn handle(topic: &str, from_hex: &str, payload_hex: &str, host_id: &[u8; 32]) -> Resp {
-    match handle_inner(topic, from_hex, payload_hex, host_id).await {
+async fn handle(topic: &str, from_hex: &str, payload_hex: &str, host_id: &[u8; 32], home: &Path) -> Resp {
+    match handle_inner(topic, from_hex, payload_hex, host_id, home).await {
         Ok(r) => r,
         Err(e) => Resp { ok: false, error: Some(e.to_string()), ..Default::default() },
     }
 }
 
-async fn handle_inner(topic: &str, from_hex: &str, payload_hex: &str, host_id: &[u8; 32]) -> Result<Resp> {
+/// Verify the capability and dispatch the action. `now_secs` is injectable for tests.
+async fn handle_inner(topic: &str, from_hex: &str, payload_hex: &str, host_id: &[u8; 32], home: &Path) -> Result<Resp> {
     let action = topic.strip_prefix("rdev/").unwrap_or(topic);
     let req: Req = serde_json::from_slice(&hex::decode(payload_hex).context("payload hex")?).context("payload json")?;
     let from: [u8; 32] = hex::decode(from_hex).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| anyhow!("bad sender id"))?;
@@ -392,28 +394,26 @@ async fn handle_inner(topic: &str, from_hex: &str, payload_hex: &str, host_id: &
     authorize(host_id, &[], &[], now(), &from, action, &chain, &|_, _| false).map_err(|e| anyhow!("denied: {e}"))?;
 
     match action {
-        "exec" => exec_action(&req).await,
-        "sync" | "delete" => fs_action(action, &req, &chain),
+        "exec" => exec_action(&req, home).await,
+        "sync" | "delete" => fs_action(action, &req, &chain, home),
         other => Err(anyhow!("unknown rdev action '{other}'")),
     }
 }
 
-async fn exec_action(req: &Req) -> Result<Resp> {
+async fn exec_action(req: &Req, home: &Path) -> Result<Resp> {
     let image = req.image.clone().ok_or_else(|| anyhow!("exec needs image"))?;
     let cmd = req.cmd.clone().unwrap_or_default();
     if cmd.is_empty() {
         return Err(anyhow!("exec needs a command"));
     }
     let docker = bollard::Docker::connect_with_local_defaults().context("Docker unavailable")?;
-    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let spec = ExecSpec { image, cmd, cwd: req.cwd.clone() };
-    let (stdout, stderr, exit_code) = exec_in_container(&docker, &spec, &home).await?;
+    let (stdout, stderr, exit_code) = exec_in_container(&docker, &spec, home).await?;
     Ok(Resp { ok: true, stdout: Some(stdout), stderr: Some(stderr), exit_code: Some(exit_code as i64), ..Default::default() })
 }
 
-fn fs_action(action: &str, req: &Req, chain: &[SignedCapability]) -> Result<Resp> {
-    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
-    let home_canon = home.canonicalize().unwrap_or_else(|_| home.clone());
+fn fs_action(action: &str, req: &Req, chain: &[SignedCapability], home: &Path) -> Result<Resp> {
+    let home_canon = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
     if req.path.contains("..") {
         return Err(anyhow!("path traversal not allowed"));
     }
@@ -455,3 +455,195 @@ url = "http://127.0.0.1:8844"
 node_id = "25df8f15853855c4cd2c5769cbc9789bf156534356ffead3b67c2c395f6d8ac1"
 # cap = "<token from ce grant>"
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ce_cap::{Caveats, Resource, SignedCapability, encode_chain};
+    use ce_identity::Identity;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn id(tag: &str) -> Identity {
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("rdev-test-{}-{n}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Identity::load_or_generate(&dir).unwrap()
+    }
+
+    fn tmp_home(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rdev-home-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Issue a self-cap from `host` to `aud` for `actions`, with optional path_prefix/expiry.
+    fn cap(host: &Identity, aud: [u8; 32], actions: &[&str], path_prefix: Option<&str>, not_after: u64) -> String {
+        let caveats = Caveats { not_after, path_prefix: path_prefix.map(|s| s.to_string()), ..Default::default() };
+        let c = SignedCapability::issue(host, aud, actions.iter().map(|s| s.to_string()).collect(), Resource::Any, caveats, 1, None);
+        encode_chain(&[c])
+    }
+
+    fn payload(req: &Req) -> String {
+        hex::encode(serde_json::to_vec(req).unwrap())
+    }
+
+    // ----- pure helpers -----
+
+    #[test]
+    fn req_resp_roundtrip() {
+        let r = Req { caps: "ab".into(), path: "a/b.txt".into(), data_hex: Some("00ff".into()), ..Default::default() };
+        let back: Req = serde_json::from_slice(&serde_json::to_vec(&r).unwrap()).unwrap();
+        assert_eq!(back.path, "a/b.txt");
+        assert_eq!(back.data_hex.as_deref(), Some("00ff"));
+        let resp = Resp { ok: false, error: Some("x".into()), ..Default::default() };
+        let rb: Resp = serde_json::from_slice(&serde_json::to_vec(&resp).unwrap()).unwrap();
+        assert!(!rb.ok);
+        assert_eq!(rb.error.as_deref(), Some("x"));
+    }
+
+    #[test]
+    fn is_hex64_rules() {
+        assert!(is_hex64(&"a".repeat(64)));
+        assert!(!is_hex64(&"a".repeat(63)));
+        assert!(!is_hex64(&"g".repeat(64)));
+    }
+
+    #[test]
+    fn remote_path_joins() {
+        assert_eq!(remote_path("code", Path::new("a/b.rs")), "code/a/b.rs");
+        assert_eq!(remote_path("", Path::new("a.rs")), "a.rs");
+    }
+
+    #[test]
+    fn skip_rules() {
+        assert!(skip("target"));
+        assert!(skip(".git"));
+        assert!(skip("foo~"));
+        assert!(skip("x.swp"));
+        assert!(!skip("main.rs"));
+    }
+
+    #[test]
+    fn resolve_alias_hex_and_errors() {
+        let mut cfg = Config::default();
+        cfg.alias.insert("desktop".into(), Alias { node_id: "d".repeat(64), cap: Some("tok".into()) });
+        // alias
+        let (n, c) = resolve(&cfg, "desktop", None).unwrap();
+        assert_eq!(n, "d".repeat(64));
+        assert_eq!(c, "tok");
+        // --cap overrides alias cap
+        let (_, c) = resolve(&cfg, "desktop", Some("override".into())).unwrap();
+        assert_eq!(c, "override");
+        // raw hex node id needs --cap
+        assert!(resolve(&cfg, &"a".repeat(64), None).is_err());
+        let (n, c) = resolve(&cfg, &"a".repeat(64), Some("t".into())).unwrap();
+        assert_eq!(n, "a".repeat(64));
+        assert_eq!(c, "t");
+        // unknown target
+        assert!(resolve(&cfg, "nope", None).is_err());
+    }
+
+    // ----- fs_action (capability already checked upstream; here we test path safety) -----
+
+    #[test]
+    fn fs_sync_writes_then_delete_idempotent() {
+        let home = tmp_home("fs-sync");
+        let chain: Vec<SignedCapability> = vec![];
+        let req = Req { path: "sub/a.txt".into(), data_hex: Some(hex::encode(b"hello")), ..Default::default() };
+        let r = fs_action("sync", &req, &chain, &home).unwrap();
+        assert!(r.ok);
+        assert_eq!(std::fs::read(home.join("sub/a.txt")).unwrap(), b"hello");
+        // delete it, then delete again (idempotent)
+        let del = Req { path: "sub/a.txt".into(), ..Default::default() };
+        assert!(fs_action("delete", &del, &chain, &home).unwrap().ok);
+        assert!(!home.join("sub/a.txt").exists());
+        assert!(fs_action("delete", &del, &chain, &home).unwrap().ok, "delete is idempotent");
+    }
+
+    #[test]
+    fn fs_rejects_path_traversal() {
+        let home = tmp_home("fs-trav");
+        let chain: Vec<SignedCapability> = vec![];
+        let req = Req { path: "../escape.txt".into(), data_hex: Some(hex::encode(b"x")), ..Default::default() };
+        assert!(fs_action("sync", &req, &chain, &home).is_err());
+    }
+
+    #[test]
+    fn fs_enforces_path_prefix_caveat() {
+        let home = tmp_home("fs-prefix");
+        let host = id("prefix-host");
+        let aud = id("prefix-aud");
+        // cap confined to "code/"
+        let token = cap(&host, aud.node_id(), &["sync"], Some("code/"), 0);
+        let chain = decode_chain(&token).unwrap();
+        // inside prefix → ok
+        let inside = Req { caps: token.clone(), path: "code/a.txt".into(), data_hex: Some(hex::encode(b"y")), ..Default::default() };
+        assert!(fs_action("sync", &inside, &chain, &home).unwrap().ok);
+        // outside prefix → denied
+        let outside = Req { caps: token, path: "secrets.txt".into(), data_hex: Some(hex::encode(b"y")), ..Default::default() };
+        assert!(fs_action("sync", &outside, &chain, &home).is_err());
+    }
+
+    // ----- handle_inner: full path incl. capability authorization -----
+
+    #[tokio::test]
+    async fn handle_authorizes_self_issued_cap_and_writes() {
+        let home = tmp_home("h-ok");
+        let host = id("h-ok-host");
+        let sender = id("h-ok-sender");
+        let token = cap(&host, sender.node_id(), &["sync"], None, 0);
+        let req = Req { caps: token, path: "f.txt".into(), data_hex: Some(hex::encode(b"data")), ..Default::default() };
+        let resp = handle_inner("rdev/sync", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &home).await.unwrap();
+        assert!(resp.ok);
+        assert_eq!(std::fs::read(home.join("f.txt")).unwrap(), b"data");
+    }
+
+    #[tokio::test]
+    async fn handle_denies_action_not_granted() {
+        let home = tmp_home("h-deny");
+        let host = id("h-deny-host");
+        let sender = id("h-deny-sender");
+        // cap grants only "sync"; request "delete"
+        let token = cap(&host, sender.node_id(), &["sync"], None, 0);
+        let req = Req { caps: token, path: "f.txt".into(), ..Default::default() };
+        let err = handle_inner("rdev/delete", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &home).await.unwrap_err();
+        assert!(err.to_string().contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn handle_denies_expired_cap() {
+        let home = tmp_home("h-exp");
+        let host = id("h-exp-host");
+        let sender = id("h-exp-sender");
+        let token = cap(&host, sender.node_id(), &["sync"], None, 1); // not_after = 1 (long past)
+        let req = Req { caps: token, path: "f.txt".into(), data_hex: Some(hex::encode(b"z")), ..Default::default() };
+        let err = handle_inner("rdev/sync", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &home).await.unwrap_err();
+        assert!(err.to_string().contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn handle_denies_cap_for_other_audience() {
+        let home = tmp_home("h-aud");
+        let host = id("h-aud-host");
+        let sender = id("h-aud-sender");
+        let other = id("h-aud-other");
+        // cap issued to `other`, presented by `sender`
+        let token = cap(&host, other.node_id(), &["sync"], None, 0);
+        let req = Req { caps: token, path: "f.txt".into(), data_hex: Some(hex::encode(b"z")), ..Default::default() };
+        let err = handle_inner("rdev/sync", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &home).await.unwrap_err();
+        assert!(err.to_string().contains("denied"));
+    }
+
+    #[tokio::test]
+    async fn handle_denies_cap_not_rooted_at_host() {
+        let home = tmp_home("h-root");
+        let host = id("h-root-host");
+        let stranger = id("h-root-stranger"); // not the host, not a configured root
+        let sender = id("h-root-sender");
+        let token = cap(&stranger, sender.node_id(), &["sync"], None, 0);
+        let req = Req { caps: token, path: "f.txt".into(), data_hex: Some(hex::encode(b"z")), ..Default::default() };
+        let err = handle_inner("rdev/sync", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &home).await.unwrap_err();
+        assert!(err.to_string().contains("denied"));
+    }
+}

@@ -21,3 +21,6 @@ walkdir = "2"
 notify = "6"
 toml = "0.8"
 bollard = "0.17"
+
+[dev-dependencies]
+ce-identity = { git = "https://github.com/ce-net/ce" }

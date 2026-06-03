@@ -1434,6 +1434,7 @@ dependencies = [
  "bollard",
  "ce-cap",
  "ce-container",
+ "ce-identity",
  "ce-rs",
  "clap",
  "dirs-next",
