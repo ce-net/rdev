@@ -6,6 +6,16 @@ description = "Remote-dev app on CE — exec + file sync/mirror over the mesh, g
 license = "MIT"
 repository = "https://github.com/ce-net/rdev"
 
+# rdev is both a reusable substrate library (the chunk/CID delta-sync engine that ce-pin and Notes
+# depend on) and the `rdev` binary (the first consumer). The library is the Auto-Sync v2 substrate.
+[lib]
+name = "rdev"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rdev"
+path = "src/main.rs"
+
 [dependencies]
 ce-rs = { git = "https://github.com/ce-net/ce-rs" }         # mesh transport (AppRequest/reply) + status
 ce-cap = { git = "https://github.com/ce-net/ce" }            # the capability verifier primitive
@@ -16,6 +26,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
+bincode = "1"
 dirs-next = "2"
 walkdir = "2"
 notify = "6"
@@ -24,3 +35,8 @@ bollard = "0.17"
 
 [dev-dependencies]
 ce-identity = { git = "https://github.com/ce-net/ce" }
+# In-process node for the two-node Auto-Sync v2 integration test (NEXT_PORT pattern, mirroring
+# ce-node's local_cluster). The test spins two real nodes, wires them over the mesh, and drives the
+# delta engine + blob store + ce-cap authorization end-to-end. It skips gracefully if a node cannot
+# start (e.g. a locked-down CI sandbox), so it never regresses the pure-unit suite.
+ce-node = { git = "https://github.com/ce-net/ce" }
