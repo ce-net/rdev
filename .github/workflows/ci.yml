@@ -1,15 +1,43 @@
 name: CI
+
 on:
   push:
   pull_request:
   workflow_dispatch:
+
+# Cancel superseded runs on the same ref so a fast push does not queue stale jobs.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  test:
-    name: cargo test
-    runs-on: ubuntu-latest
+  build-test:
+    name: build + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
+
       - uses: Swatinem/rust-cache@v2
-      - name: Unit + integration tests
-        run: cargo test --all --locked
+
+      # rdev's library + binary half resolve their cross-repo dependencies (ce-rs, and ce-cap /
+      # ce-identity / ce-container / ce-node from the `ce` repo) as **git** dependencies pinned in
+      # Cargo.lock, so cargo fetches them directly — no sibling checkout is required. (If this repo
+      # is ever switched to `path = "../<dep>"` deps, add a `actions/checkout@v4` step per sibling
+      # with `repository: ce-net/<dep>` and `path: ../<dep>`, checking out ce-net/ce as ../ce for
+      # the ce-cap / ce-identity / ce-container / ce-node crates that live inside it.)
+      - name: Build (all targets, locked)
+        run: cargo build --all-targets --locked
+
+      # The two-node integration test (tests/two_node_sync.rs) spins real in-process CE nodes and
+      # skips gracefully (prints a note, returns Ok) when a node cannot start or the mesh does not
+      # converge inside a locked-down CI sandbox, so it never regresses the pure-unit suite. Docker
+      # is NOT required: ce-container compiles without a running daemon and the exec path is not
+      # exercised here.
+      - name: Test (workspace, locked)
+        run: cargo test --locked

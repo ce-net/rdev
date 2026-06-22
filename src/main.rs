@@ -752,6 +752,13 @@ fn remote_join(remote_root: &str, rel: &str) -> String {
 }
 
 /// Write bytes to `path` atomically: temp file + fsync + rename.
+///
+/// Cross-platform note: `std::fs::rename` replaces the destination on every supported OS — on
+/// Windows it maps to `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, so the rename-over-existing is
+/// atomic there too. The one Windows-specific caveat is that the rename fails with a sharing
+/// violation if another process holds an open handle to `path` (e.g. an editor mid-write or an
+/// antivirus scanner). That surfaces here as a normal `Err` (reported as `WARN <rel>` by the caller
+/// and retried on the next sync pass) rather than silent corruption, which is the safe outcome.
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     let tmp = path.with_extension("rdev-tmp");
@@ -769,7 +776,7 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 async fn serve(client: &CeClient) -> Result<()> {
     let host_hex = client.status().await?.node_id;
     let host_id: [u8; 32] = hex::decode(&host_hex).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| anyhow!("bad node id"))?;
-    let home = dirs_next::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let home = dirs_next::home_dir().unwrap_or_else(std::env::temp_dir);
     // Accepted capability roots: chains rooted at any of these (or at this host's own key) are
     // honored. Empty by default (only self-issued caps). An org/fleet sets a shared root here so
     // a seed can delegate attenuated caps down a replication tree that every node accepts.
@@ -834,7 +841,16 @@ fn load_roots() -> Vec<[u8; 32]> {
     let path = std::env::var_os("RDEV_ROOTS")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("CE_DATA_DIR").map(|d| PathBuf::from(d).join("roots")))
-        .unwrap_or_else(|| dirs_next::home_dir().unwrap_or_default().join(".local/share/ce/roots"));
+        .unwrap_or_else(|| {
+            // Join components individually so the path renders with the platform separator
+            // (a literal ".local/share/ce/roots" in one `join` keeps forward slashes on Windows).
+            dirs_next::home_dir()
+                .unwrap_or_default()
+                .join(".local")
+                .join("share")
+                .join("ce")
+                .join("roots")
+        });
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
@@ -903,6 +919,13 @@ fn safe_target(path: &str, chain: &[SignedCapability], home: &Path) -> Result<Pa
     if path.contains("..") {
         return Err(anyhow!("path traversal not allowed"));
     }
+    // Wire paths are forward-slash and relative. Reject anything that would make `home.join(path)`
+    // absolute and escape `home`: a leading '/', a backslash (Windows separator), or a drive prefix
+    // like `C:`. On unix `home.join("/etc/x")` discards `home`; on Windows `home.join("C:\\x")` or a
+    // backslash component does the same — this guard closes both before the join.
+    if is_unsafe_wire_path(path) {
+        return Err(anyhow!("absolute or non-forward-slash path not allowed"));
+    }
     if let Some(prefix) = chain.last().and_then(|c| c.cap.caveats.path_prefix.as_ref()) {
         if !path.starts_with(prefix.as_str()) {
             return Err(anyhow!("path outside capability prefix '{prefix}'"));
@@ -918,6 +941,18 @@ fn safe_target(path: &str, chain: &[SignedCapability], home: &Path) -> Result<Pa
         }
     }
     Ok(target)
+}
+
+/// True if a wire `path` is unsafe to join under `home`: absolute (leading '/'), containing a
+/// backslash (the Windows separator — wire paths are always forward-slash), or carrying a Windows
+/// drive/UNC prefix (`C:`, `\\`). Forward-slash relative paths pass unchanged on every platform.
+fn is_unsafe_wire_path(path: &str) -> bool {
+    if path.starts_with('/') || path.contains('\\') {
+        return true;
+    }
+    // A `<letter>:` drive prefix (e.g. "C:foo", "C:/foo") would escape the join on Windows.
+    let bytes = path.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 /// Dispatch a `rdev/sync2/*` verb, returning the raw JSON reply bytes (each verb has its own shape).
@@ -1232,18 +1267,29 @@ fn spawn_action(req: &Req, chain: &[SignedCapability], home: &Path) -> Result<Re
     std::fs::create_dir_all(&cwd).ok();
     // Scrub the environment so the child can't inherit the server's secrets (tokens, keys, etc.).
     // Provide only a minimal, safe set.
-    let path_env = std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".to_string());
-    let child = std::process::Command::new(&cmd[0])
+    #[cfg(unix)]
+    let default_path = "/usr/bin:/bin";
+    #[cfg(windows)]
+    // On Windows the program loader needs the System32 directory on PATH to resolve core DLLs and
+    // built-in commands; a bare `/usr/bin:/bin` would render most allow-listed programs unspawnable.
+    let default_path = "C:\\Windows\\System32;C:\\Windows";
+    let path_env = std::env::var("PATH").unwrap_or_else(|_| default_path.to_string());
+    let mut command = std::process::Command::new(&cmd[0]);
+    command
         .args(&cmd[1..])
         .current_dir(&cwd)
         .env_clear()
         .env("PATH", path_env)
-        .env("HOME", &cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .with_context(|| format!("spawn '{}'", cmd[0]))?;
+        .stderr(std::process::Stdio::null());
+    // Home is `HOME` on unix, `USERPROFILE` on Windows. Set both so the child's tooling resolves the
+    // confined home regardless of platform (the unscrubbed counterpart would otherwise be missing).
+    #[cfg(unix)]
+    command.env("HOME", &cwd);
+    #[cfg(windows)]
+    command.env("USERPROFILE", &cwd);
+    let child = command.spawn().with_context(|| format!("spawn '{}'", cmd[0]))?;
     Ok(Resp { ok: true, stdout: Some(format!("spawned pid {}", child.id())), ..Default::default() })
 }
 
@@ -1263,6 +1309,9 @@ fn fs_action(action: &str, req: &Req, chain: &[SignedCapability], home: &Path) -
     let home_canon = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
     if req.path.contains("..") {
         return Err(anyhow!("path traversal not allowed"));
+    }
+    if is_unsafe_wire_path(&req.path) {
+        return Err(anyhow!("absolute or non-forward-slash path not allowed"));
     }
     if let Some(prefix) = chain.last().and_then(|c| c.cap.caveats.path_prefix.as_ref()) {
         if !req.path.starts_with(prefix.as_str()) {
@@ -1411,6 +1460,20 @@ mod tests {
         // file_cid matches sha256.
         let a = entries.iter().find(|e| e.path == "proj/a.txt").unwrap();
         assert_eq!(a.file_cid, rdev::chunk::content_id(b"hello"));
+    }
+
+    #[test]
+    fn unsafe_wire_path_rejects_absolute_backslash_and_drive() {
+        // Legitimate forward-slash relative paths are accepted on every platform.
+        assert!(!is_unsafe_wire_path("src/main.rs"));
+        assert!(!is_unsafe_wire_path("a.txt"));
+        // Absolute, backslash, and drive-prefixed paths are rejected (Windows-escape hardening).
+        assert!(is_unsafe_wire_path("/etc/passwd"));
+        assert!(is_unsafe_wire_path("..\\evil"));
+        assert!(is_unsafe_wire_path("sub\\file.txt"));
+        assert!(is_unsafe_wire_path("C:\\Windows\\System32"));
+        assert!(is_unsafe_wire_path("C:/Windows"));
+        assert!(is_unsafe_wire_path("d:rel"));
     }
 
     #[test]
@@ -1636,9 +1699,30 @@ mod tests {
     // ----- spawn: HOST process execution, gated by the `spawn` ability -----
 
     /// Allow the programs the spawn tests launch (default-deny otherwise). Idempotent value so
-    /// concurrent tests setting the same env var don't disagree.
+    /// concurrent tests setting the same env var don't disagree. The shell differs per OS (`sh` on
+    /// unix, `cmd` on Windows) so the spawn tests run identically on every platform.
     fn allow_spawn() {
-        unsafe { std::env::set_var("RDEV_SPAWN_ALLOW", "sh,true") };
+        #[cfg(unix)]
+        let allow = "sh,true";
+        #[cfg(windows)]
+        let allow = "cmd,true";
+        unsafe { std::env::set_var("RDEV_SPAWN_ALLOW", allow) };
+    }
+
+    /// Build a `cmd` vector that writes `text` into the file `rel` (under the spawn cwd), using the
+    /// platform shell. Unix: `sh -c "echo text > rel"`. Windows: `cmd /C "echo text> rel"`.
+    fn shell_write(text: &str, rel: &str) -> Vec<String> {
+        #[cfg(unix)]
+        {
+            vec!["sh".into(), "-c".into(), format!("echo {text} > {rel}")]
+        }
+        #[cfg(windows)]
+        {
+            // No space before `>` on Windows: `echo foo > f` writes a trailing space; `echo foo> f`
+            // does not. The marker-existence assertions only check the file is created, but keep it
+            // tidy regardless.
+            vec!["cmd".into(), "/C".into(), format!("echo {text}> {rel}")]
+        }
     }
 
     #[tokio::test]
@@ -1649,7 +1733,7 @@ mod tests {
         let host = id("spawn-ok-host");
         let sender = id("spawn-ok-sender");
         let token = cap(&host, sender.node_id(), &["spawn"], None, 0);
-        let req = Req { caps: token, cmd: Some(vec!["sh".into(), "-c".into(), "echo hi > spawned_marker".into()]), ..Default::default() };
+        let req = Req { caps: token, cmd: Some(shell_write("hi", "spawned_marker")), ..Default::default() };
         let resp = handle_inner("rdev/spawn", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &[], &std::collections::HashSet::new(), &home).await.unwrap();
         assert!(resp.ok);
         assert!(resp.stdout.unwrap_or_default().contains("spawned pid"));
@@ -1668,7 +1752,7 @@ mod tests {
         let host = id("spawn-deny-host");
         let sender = id("spawn-deny-sender");
         let token = cap(&host, sender.node_id(), &["sync"], None, 0); // no "spawn"
-        let req = Req { caps: token, cmd: Some(vec!["sh".into(), "-c".into(), "echo pwned > pwned".into()]), ..Default::default() };
+        let req = Req { caps: token, cmd: Some(shell_write("pwned", "pwned")), ..Default::default() };
         let err = handle_inner("rdev/spawn", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &[], &std::collections::HashSet::new(), &home).await.unwrap_err();
         assert!(err.to_string().contains("denied"));
         assert!(!home.join("pwned").exists());
@@ -1688,7 +1772,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_denied_for_non_allowlisted_program() {
-        allow_spawn(); // allows sh,true — but NOT `echo`
+        allow_spawn(); // allows the platform shell + `true` — but NOT `echo`
         let home = tmp_home("spawn-allow");
         let host = id("spawn-allow-host");
         let sender = id("spawn-allow-sender");
@@ -1715,7 +1799,7 @@ mod tests {
         let token = encode_chain(&[c0, c1]);
 
         // B presents the delegated chain to host C; requester = B. C honors it (rooted at R).
-        let req = Req { caps: token, cmd: Some(vec!["sh".into(), "-c".into(), "echo ok > deleg_marker".into()]), ..Default::default() };
+        let req = Req { caps: token, cmd: Some(shell_write("ok", "deleg_marker")), ..Default::default() };
         let resp = handle_inner("rdev/spawn", &hex::encode(mid.node_id()), &payload(&req), &host.node_id(), &[root.node_id()], &std::collections::HashSet::new(), &home).await.unwrap();
         assert!(resp.ok);
         let marker = home.join("deleg_marker");
@@ -1738,7 +1822,7 @@ mod tests {
         let c0 = SignedCapability::issue(&root, seed.node_id(), vec!["sync".into()], Resource::Any, Caveats::default(), 1, None);
         let c1 = SignedCapability::issue(&seed, mid.node_id(), vec!["spawn".into()], Resource::Any, Caveats::default(), 2, Some(c0.id()));
         let token = encode_chain(&[c0, c1]);
-        let req = Req { caps: token, cmd: Some(vec!["sh".into(), "-c".into(), "echo pwn > pwn".into()]), ..Default::default() };
+        let req = Req { caps: token, cmd: Some(shell_write("pwn", "pwn")), ..Default::default() };
         let err = handle_inner("rdev/spawn", &hex::encode(mid.node_id()), &payload(&req), &host.node_id(), &[root.node_id()], &std::collections::HashSet::new(), &home).await.unwrap_err();
         assert!(err.to_string().contains("denied"));
         assert!(!home.join("pwn").exists());
