@@ -913,6 +913,19 @@ fn authorize_sync2(
     Ok(chain)
 }
 
+/// Boundary-aware `path_prefix` caveat check. A raw `starts_with` admits sibling paths that merely
+/// share a textual prefix (scope `proj` would admit `project-secret/x`). Match on a path component
+/// boundary instead: the prefix admits `path` iff the prefix is empty, equals `path`, or `path`
+/// begins with `prefix` followed by a `/`. Trailing slashes on the prefix are normalized away first
+/// (a `code/` caveat and a `code` caveat are equivalent). Defense-in-depth only — the `..`-reject and
+/// canonicalize-under-`home` checks are the real containment — but this layer should be tight too.
+fn prefix_admits(prefix: &str, path: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    prefix.is_empty()
+        || path == prefix
+        || path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Enforce path safety for a sync2 `path`: reject `..` traversal and require the `path_prefix`
 /// caveat (if present on the cap) to be a prefix. Returns the absolute target under `home`.
 fn safe_target(path: &str, chain: &[SignedCapability], home: &Path) -> Result<PathBuf> {
@@ -927,7 +940,7 @@ fn safe_target(path: &str, chain: &[SignedCapability], home: &Path) -> Result<Pa
         return Err(anyhow!("absolute or non-forward-slash path not allowed"));
     }
     if let Some(prefix) = chain.last().and_then(|c| c.cap.caveats.path_prefix.as_ref()) {
-        if !path.starts_with(prefix.as_str()) {
+        if !prefix_admits(prefix, path) {
             return Err(anyhow!("path outside capability prefix '{prefix}'"));
         }
     }
@@ -1488,6 +1501,32 @@ mod tests {
         let chain = decode_chain(&token).unwrap();
         assert!(safe_target("code/a.rs", &chain, &home).is_ok());
         assert!(safe_target("secrets.txt", &chain, &home).is_err());
+    }
+
+    #[test]
+    fn prefix_admits_respects_component_boundary() {
+        // Empty prefix admits everything.
+        assert!(prefix_admits("", "anything/x"));
+        // Exact match and proper descendants are admitted.
+        assert!(prefix_admits("proj", "proj"));
+        assert!(prefix_admits("proj", "proj/a"));
+        assert!(prefix_admits("proj/", "proj/a")); // trailing slash normalized
+        // Sibling sharing a textual prefix is NOT admitted (the boundary bug).
+        assert!(!prefix_admits("proj", "project-secret/x"));
+        assert!(!prefix_admits("proj", "projx"));
+    }
+
+    #[test]
+    fn safe_target_prefix_denies_sibling_prefix() {
+        // Regression for Theme A: scope `proj` must NOT admit `project-secret/x` (raw starts_with
+        // would), while still allowing the legitimate `proj/a`.
+        let home = tmp_home("safe-tgt-boundary");
+        let host = id("safe-boundary-host");
+        let aud = id("safe-boundary-aud");
+        let token = cap(&host, aud.node_id(), &["sync"], Some("proj"), 0);
+        let chain = decode_chain(&token).unwrap();
+        assert!(safe_target("proj/a", &chain, &home).is_ok());
+        assert!(safe_target("project-secret/x", &chain, &home).is_err());
     }
 
     // ----- sync2 verb handlers (capability + path safety, no live node needed) -----
