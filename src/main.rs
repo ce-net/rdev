@@ -1092,7 +1092,7 @@ async fn handle_sync2_inner(
                 return Err(anyhow!("path traversal not allowed"));
             }
             if let Some(p) = chain.last().and_then(|c| c.cap.caveats.path_prefix.as_ref()) {
-                if !req.prefix.starts_with(p.as_str()) && !p.starts_with(req.prefix.as_str()) {
+                if !prefix_admits(p, &req.prefix) && !prefix_admits(&req.prefix, p) {
                     return Err(anyhow!("prefix outside capability"));
                 }
             }
@@ -1269,7 +1269,7 @@ fn spawn_action(req: &Req, chain: &[SignedCapability], home: &Path) -> Result<Re
                 return Err(anyhow!("path traversal not allowed"));
             }
             if let Some(prefix) = chain.last().and_then(|c| c.cap.caveats.path_prefix.as_ref()) {
-                if !c.starts_with(prefix.as_str()) {
+                if !prefix_admits(prefix, c) {
                     return Err(anyhow!("cwd outside capability prefix '{prefix}'"));
                 }
             }
@@ -1327,7 +1327,7 @@ fn fs_action(action: &str, req: &Req, chain: &[SignedCapability], home: &Path) -
         return Err(anyhow!("absolute or non-forward-slash path not allowed"));
     }
     if let Some(prefix) = chain.last().and_then(|c| c.cap.caveats.path_prefix.as_ref()) {
-        if !req.path.starts_with(prefix.as_str()) {
+        if !prefix_admits(prefix, &req.path) {
             return Err(anyhow!("path outside capability prefix '{prefix}'"));
         }
     }
@@ -1671,6 +1671,21 @@ mod tests {
         // outside prefix → denied
         let outside = Req { caps: token, path: "secrets.txt".into(), data_hex: Some(hex::encode(b"y")), ..Default::default() };
         assert!(fs_action("sync", &outside, &chain, &home).is_err());
+    }
+
+    #[test]
+    fn fs_prefix_denies_sibling_prefix() {
+        // Regression for Theme A at the fs_action call site: a cap scoped to "proj" must NOT admit
+        // the sibling "project-secret/x" (a raw starts_with would), while still allowing "proj/a".
+        let home = tmp_home("fs-sibling-prefix");
+        let host = id("fs-sib-host");
+        let aud = id("fs-sib-aud");
+        let token = cap(&host, aud.node_id(), &["sync"], Some("proj"), 0);
+        let chain = decode_chain(&token).unwrap();
+        let inside = Req { caps: token.clone(), path: "proj/a.txt".into(), data_hex: Some(hex::encode(b"y")), ..Default::default() };
+        assert!(fs_action("sync", &inside, &chain, &home).unwrap().ok);
+        let sibling = Req { caps: token, path: "project-secret/x".into(), data_hex: Some(hex::encode(b"y")), ..Default::default() };
+        assert!(fs_action("sync", &sibling, &chain, &home).is_err(), "sibling prefix must be denied");
     }
 
     // ----- handle_inner: full path incl. capability authorization -----
