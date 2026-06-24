@@ -33,6 +33,11 @@ notify = "6"
 toml = "0.8"
 bollard = "0.17"
 
+# Unix-only: setsid (detach run-jobs into their own session/process group) + kill (group signal,
+# liveness probe). rdev/run/* uses these to detach long-lived host jobs and to kill the whole group.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 ce-identity = { git = "https://github.com/ce-net/ce" }
 # In-process node for the two-node Auto-Sync v2 integration test (NEXT_PORT pattern, mirroring

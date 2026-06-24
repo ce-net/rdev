@@ -3697,6 +3697,7 @@ dependencies = [
  "clap",
  "dirs-next",
  "hex",
+ "libc",
  "notify",
  "serde",
  "serde_json",

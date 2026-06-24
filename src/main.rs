@@ -16,6 +16,14 @@
 //!     DANGEROUS: spawns native code on the host, not sandboxed. Gated by the `spawn` ability,
 //!     which a cap must explicitly carry. This is what lets a node bring up a new CE node +
 //!     `rdev serve` on a target — the basis for self-replicating fleets (see the `replicator` app).
+//!   - `rdev/run/start` `{caps, cmd, cwd}`        — start a long-lived detached HOST job whose
+//!     stdout+stderr stream to a logfile; returns `{job_id}`. Same gating as `spawn` (the `spawn`
+//!     ability + `$RDEV_SPAWN_ALLOW` basename allowlist + cwd confinement + scrubbed env), but the
+//!     child writes to `~/.rdev/jobs/<job_id>/log` instead of `/dev/null`, so the run is observable.
+//!   - `rdev/run/logs`  `{caps, job_id, offset}`  — `{data_hex, next_offset, running, exit_code}`:
+//!     a cheap delta read of the job log from `offset` + liveness. Polled by `rdev run` for live
+//!     output; short request, no long-held connection, so the 10-min exec cap never applies.
+//!   - `rdev/run/kill`  `{caps, job_id}`          — signal the job's process group (idempotent).
 //!
 //! ## Auto-Sync v2 protocol (continuous, content-addressed; topic `rdev/sync2/<verb>`)
 //!   - `rdev/sync2/have`   `{caps, chunks}`            — which chunk CIDs does the receiver lack?
@@ -28,8 +36,12 @@
 //!   substrate `ce-pin` and Notes depend on. See `PLAN/05-autosync.md`.
 //!
 //! ## Commands
-//!   - `rdev serve`                       — run the server (handles the actions above + sync2/*).
-//!   - `rdev exec <target> -- <cmd…>`     — run a command on a peer.
+//!   - `rdev serve`                       — run the server (handles the actions above + run/* + sync2/*).
+//!   - `rdev exec <target> -- <cmd…>`     — run a command on a peer (sandboxed container, buffered).
+//!   - `rdev run <target> [--cwd D] -- <cmd…>` — long-lived detached HOST job with LIVE logs (poll
+//!     run/logs every ~700ms; Ctrl-C kills it). Gated by the `spawn` ability, like `spawn`.
+//!   - `rdev build <target> <dir> [--remote D] -- <cmd…>` — one-command dogfooded build/test loop:
+//!     `syncd --once` the dir to the target, then `run` the command there with live logs.
 //!   - `rdev push <file> <target:path>`   — push one file (whole-file, one-shot).
 //!   - `rdev rm <target:path>`            — delete one file.
 //!   - `rdev syncd <dir> <target:dir>`    — continuous, content-addressed, resumable folder sync.
@@ -139,6 +151,37 @@ enum Cmd {
         #[arg(long, default_value_t = 500)]
         debounce_ms: u64,
     },
+    /// Run a long-lived command on a HOST (detached, with live logs), gated by the `spawn` ability.
+    ///
+    /// `rdev run <target> [--cwd DIR] -- <cmd…>`. Unlike `exec` (sandboxed container, network off,
+    /// buffered, 10-min cap) this starts a detached HOST job whose stdout+stderr stream to a logfile;
+    /// the client polls log-tail + status and prints output live until the job exits, then exits with
+    /// the job's code. Ctrl-C kills the remote job. Same gating as the `spawn` action (the `spawn`
+    /// ability + the `RDEV_SPAWN_ALLOW` basename allowlist + cwd confined to home).
+    Run {
+        target: String,
+        #[arg(long)]
+        cwd: Option<String>,
+        #[arg(long)]
+        cap: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// One-command dogfooded build/test loop: sync a local dir to the target, then `run` there.
+    ///
+    /// `rdev build <target> <localdir> [--remote DIR] -- <cmd…>`. Equivalent to
+    /// `rdev syncd <localdir> <target>:<remote> --once` followed by
+    /// `rdev run <target> --cwd <remote> -- <cmd…>`. `--remote` defaults to the local dir's basename.
+    Build {
+        target: String,
+        localdir: PathBuf,
+        #[arg(long)]
+        remote: Option<String>,
+        #[arg(long)]
+        cap: Option<String>,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
     /// Write an example config to the config path.
     Init,
 }
@@ -182,6 +225,12 @@ struct Req {
     cmd: Option<Vec<String>>,
     #[serde(default)]
     cwd: Option<String>,
+    /// `rdev/run/logs` + `rdev/run/kill`: which job.
+    #[serde(default)]
+    job_id: Option<String>,
+    /// `rdev/run/logs`: byte offset into the logfile to read from.
+    #[serde(default)]
+    offset: Option<u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -193,6 +242,30 @@ struct Resp {
     stdout: Option<String>,
     #[serde(default)]
     stderr: Option<String>,
+    #[serde(default)]
+    exit_code: Option<i64>,
+    /// `rdev/run/start`: the created job id.
+    #[serde(default)]
+    job_id: Option<String>,
+}
+
+/// Reply for `rdev/run/logs`: a delta of the job's combined stdout+stderr log from `offset`, plus
+/// liveness. `running` is true while the child's process group is still alive; once it exits the
+/// wrapper records the status, so `exit_code` becomes `Some` and `running` flips to false. The
+/// client polls with `next_offset` until `running` is false, then exits with `exit_code`.
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct RunLogsResp {
+    ok: bool,
+    #[serde(default)]
+    error: Option<String>,
+    /// Hex of the new log bytes from the requested offset.
+    #[serde(default)]
+    data_hex: String,
+    /// Offset to pass on the next poll (== requested offset + bytes returned).
+    #[serde(default)]
+    next_offset: u64,
+    #[serde(default)]
+    running: bool,
     #[serde(default)]
     exit_code: Option<i64>,
 }
@@ -232,6 +305,13 @@ async fn main() -> Result<()> {
             let conflict: Policy = conflict.parse()?;
             let opts = SyncdOpts { bidirectional, conflict, once, dry_run, debounce_ms };
             syncd(&client, &cfg, &dir, &dest, cap, opts).await
+        }
+        Cmd::Run { target, cwd, cap, command } => {
+            let (node_id, caps) = resolve(&cfg, &target, cap)?;
+            run(&client, &node_id, &caps, cwd, command).await
+        }
+        Cmd::Build { target, localdir, remote, cap, command } => {
+            build(&client, &cfg, &target, &localdir, remote, cap, command).await
         }
         Cmd::Init => unreachable!(),
     }
@@ -326,6 +406,115 @@ async fn rm(client: &CeClient, cfg: &Config, dest: &str, cap: Option<String>) ->
     let (node_id, caps) = resolve(cfg, target, cap)?;
     let req = Req { caps, path: path.into(), ..Default::default() };
     ok_reply(client.request(&node_id, "rdev/delete", &serde_json::to_vec(&req)?, 60_000).await?, &format!("deleted {path}"))
+}
+
+/// `rdev run <target> [--cwd DIR] -- <cmd…>`: start a detached HOST job on the target, then poll its
+/// log-tail + status every ~700ms, streaming new bytes to stdout live until it exits, then exit with
+/// the job's code. Ctrl-C sends `rdev/run/kill`. Request/reply only — each poll is a short, cheap
+/// `run/logs` call, so there is no long-held connection and no 10-minute request cap concern.
+async fn run(
+    client: &CeClient,
+    node_id: &str,
+    caps: &str,
+    cwd: Option<String>,
+    command: Vec<String>,
+) -> Result<()> {
+    if command.is_empty() {
+        return Err(anyhow!("specify a command, e.g. rdev run desktop --cwd proj -- cargo build"));
+    }
+    // 1) start the job.
+    let start = Req { caps: caps.to_string(), cmd: Some(command), cwd, ..Default::default() };
+    let reply = client.request(node_id, "rdev/run/start", &serde_json::to_vec(&start)?, 60_000).await?;
+    let r: Resp = serde_json::from_slice(&reply)?;
+    if !r.ok {
+        return Err(anyhow!("run refused: {}", r.error.unwrap_or_default()));
+    }
+    let job_id = r.job_id.ok_or_else(|| anyhow!("server did not return a job_id"))?;
+    eprintln!("rdev: job {job_id} started on {}…", &node_id[..node_id.len().min(16)]);
+
+    // 2) poll logs until the job exits. Ctrl-C kills the remote job and exits.
+    use std::io::Write;
+    let mut offset: u64 = 0;
+    loop {
+        let poll = async {
+            let req = Req {
+                caps: caps.to_string(),
+                job_id: Some(job_id.clone()),
+                offset: Some(offset),
+                ..Default::default()
+            };
+            client.request(node_id, "rdev/run/logs", &serde_json::to_vec(&req)?, 60_000).await
+        };
+        let reply = tokio::select! {
+            res = poll => res?,
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\nrdev: killing job {job_id}…");
+                let kreq = Req { caps: caps.to_string(), job_id: Some(job_id.clone()), ..Default::default() };
+                let _ = client.request(node_id, "rdev/run/kill", &serde_json::to_vec(&kreq)?, 30_000).await;
+                std::process::exit(130);
+            }
+        };
+        let lr: RunLogsResp = serde_json::from_slice(&reply)?;
+        if !lr.ok {
+            return Err(anyhow!("run/logs failed: {}", lr.error.unwrap_or_default()));
+        }
+        if !lr.data_hex.is_empty() {
+            let bytes = hex::decode(&lr.data_hex).context("log data hex")?;
+            let mut out = std::io::stdout();
+            out.write_all(&bytes)?;
+            out.flush()?;
+        }
+        offset = lr.next_offset;
+        if !lr.running {
+            let code = lr.exit_code.unwrap_or(0);
+            if code != 0 {
+                std::process::exit(code as i32);
+            }
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+    }
+}
+
+/// `rdev build <target> <localdir> [--remote DIR] -- <cmd…>`: the one-command dogfooded build/test
+/// loop. Content-addressed-syncs `<localdir>` to `<target>:<remote>` (== `syncd --once`), then runs
+/// `<cmd…>` there with live logs (== `rdev run --cwd <remote>`). `--remote` defaults to the local
+/// dir's basename.
+async fn build(
+    client: &CeClient,
+    cfg: &Config,
+    target: &str,
+    localdir: &Path,
+    remote: Option<String>,
+    cap: Option<String>,
+    command: Vec<String>,
+) -> Result<()> {
+    if command.is_empty() {
+        return Err(anyhow!("specify a command, e.g. rdev build desktop ./proj -- cargo test"));
+    }
+    let remote = remote.unwrap_or_else(|| {
+        localdir
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "rdev-build".to_string())
+    });
+    let (node_id, caps) = resolve(cfg, target, cap)?;
+
+    // 1) push the tree (content-addressed, --once).
+    let dest = format!("{target}:{remote}");
+    let opts = SyncdOpts {
+        bidirectional: false,
+        conflict: Policy::Lww,
+        once: true,
+        dry_run: false,
+        debounce_ms: 500,
+    };
+    syncd(client, cfg, localdir, &dest, Some(caps.clone()), opts).await?;
+
+    // 2) run the command in the synced remote dir, with live logs.
+    let remote_cwd = remote_root_of(&remote);
+    run(client, &node_id, &caps, Some(remote_cwd), command).await
 }
 
 fn split_dest(dest: &str) -> Result<(&str, &str)> {
@@ -783,7 +972,7 @@ async fn serve(client: &CeClient) -> Result<()> {
     let roots = load_roots();
     let host_short = host_hex[..16].to_string();
     println!(
-        "rdev serving as {}… (rdev/sync, rdev/delete, rdev/exec, rdev/spawn, rdev/sync2/*) — {} configured root(s)",
+        "rdev serving as {}… (rdev/sync, rdev/delete, rdev/exec, rdev/spawn, rdev/run/*, rdev/sync2/*) — {} configured root(s)",
         host_short,
         roots.len()
     );
@@ -817,6 +1006,9 @@ async fn serve(client: &CeClient) -> Result<()> {
             // node client (blob store) + the home tree state, so they are dispatched separately.
             let reply_bytes = if m.topic.starts_with(rdev::syncproto::TOPIC_PREFIX) {
                 handle_sync2(client, &m.topic, &m.from, &m.payload_hex, &host_id, &roots, &revoked, &home, &host_short).await
+            } else if m.topic.starts_with("rdev/run/") {
+                // The run/* verbs have their own reply shapes (run/logs is RunLogsResp, not Resp).
+                handle_run(&m.topic, &m.from, &m.payload_hex, &host_id, &roots, &revoked, &home).await
             } else {
                 let resp = handle(&m.topic, &m.from, &m.payload_hex, &host_id, &roots, &revoked, &home).await;
                 serde_json::to_vec(&resp).unwrap_or_default()
@@ -886,6 +1078,397 @@ async fn handle_inner(topic: &str, from_hex: &str, payload_hex: &str, host_id: &
         "sync" | "delete" => fs_action(action, &req, &chain, home),
         other => Err(anyhow!("unknown rdev action '{other}'")),
     }
+}
+
+// ----- run: long-lived detached HOST jobs with pollable live logs (rdev/run/*) -----
+//
+// `run/start` spawns the child detached (own process group) with stdout+stderr redirected to a
+// per-job logfile, wrapped so the wrapper records the exit status on completion. `run/logs` is a
+// short, cheap delta read of that logfile + liveness — no long-held connection, so the 10-min
+// request cap never applies. `run/kill` signals the whole process group. Jobs live on disk under
+// `~/.rdev/jobs/<job_id>/` so logs survive a `serve` restart; a small retention cap trims old jobs.
+
+/// Directory holding all run-jobs: `<home>/.rdev/jobs`.
+fn jobs_dir(home: &Path) -> PathBuf {
+    home.join(".rdev").join("jobs")
+}
+
+/// Per-job metadata persisted to `meta.json` (so logs/status survive a serve restart).
+#[derive(Debug, Serialize, Deserialize)]
+struct JobMeta {
+    job_id: String,
+    pid: i64,
+    cmd: Vec<String>,
+    cwd: String,
+    started_ms: u128,
+}
+
+/// Generate a short, filesystem-safe job id from the process id, a monotonic counter, and the clock.
+/// No consensus concern here (these ids are local to one host's job dir), so `std` entropy is fine.
+fn new_job_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+    // Mix the pieces and hex-encode a short, collision-resistant-enough id for a single host.
+    let mix = (nanos as u64) ^ (seq.wrapping_mul(0x9E37_79B9_7F4A_7C15)) ^ ((std::process::id() as u64) << 32);
+    format!("{mix:016x}")
+}
+
+/// Dispatch a `rdev/run/*` verb, returning the raw JSON reply bytes (run/logs has its own shape).
+async fn handle_run(
+    topic: &str,
+    from_hex: &str,
+    payload_hex: &str,
+    host_id: &[u8; 32],
+    roots: &[[u8; 32]],
+    revoked: &HashSet<([u8; 32], u64)>,
+    home: &Path,
+) -> Vec<u8> {
+    match handle_run_inner(topic, from_hex, payload_hex, host_id, roots, revoked, home) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            // All run replies share the {ok,error} prefix, so a generic error reply decodes for any.
+            serde_json::to_vec(&serde_json::json!({ "ok": false, "error": e.to_string() }))
+                .unwrap_or_default()
+        }
+    }
+}
+
+/// Verify the capability (the `spawn` ability — `run` is `spawn` writing to a logfile) and dispatch.
+fn handle_run_inner(
+    topic: &str,
+    from_hex: &str,
+    payload_hex: &str,
+    host_id: &[u8; 32],
+    roots: &[[u8; 32]],
+    revoked: &HashSet<([u8; 32], u64)>,
+    home: &Path,
+) -> Result<Vec<u8>> {
+    let req: Req =
+        serde_json::from_slice(&hex::decode(payload_hex).context("payload hex")?).context("payload json")?;
+    let from: [u8; 32] =
+        hex::decode(from_hex).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| anyhow!("bad sender id"))?;
+    let chain: Vec<SignedCapability> = decode_chain(&req.caps).map_err(|_| anyhow!("bad capability"))?;
+    let is_revoked = |issuer: &[u8; 32], nonce: u64| revoked.contains(&(*issuer, nonce));
+    // `run/*` is gated by the same `spawn` ability as the spawn action: it launches native host code.
+    authorize(host_id, roots, &[], now(), &from, "spawn", &chain, &is_revoked)
+        .map_err(|e| anyhow!("denied: {e}"))?;
+
+    match topic {
+        "rdev/run/start" => {
+            let resp = run_start(&req, &chain, home)?;
+            Ok(serde_json::to_vec(&resp)?)
+        }
+        "rdev/run/logs" => {
+            let resp = run_logs(&req, home)?;
+            Ok(serde_json::to_vec(&resp)?)
+        }
+        "rdev/run/kill" => {
+            let resp = run_kill(&req, home)?;
+            Ok(serde_json::to_vec(&resp)?)
+        }
+        other => Err(anyhow!("unknown run verb '{other}'")),
+    }
+}
+
+/// Max retained job directories (oldest trimmed on each new start). Bounds disk use from many runs.
+const MAX_RETAINED_JOBS: usize = 64;
+
+/// `rdev/run/start`: validate against the spawn allowlist + cwd confinement (identical to
+/// `spawn_action`), create `~/.rdev/jobs/<job_id>/`, spawn the child detached with stdout+stderr
+/// redirected to `log`, wrapped so its exit code lands in `status` on completion. Returns the job id.
+fn run_start(req: &Req, chain: &[SignedCapability], home: &Path) -> Result<Resp> {
+    let cmd = req.cmd.clone().unwrap_or_default();
+    if cmd.is_empty() {
+        return Err(anyhow!("run needs a command"));
+    }
+    // Default-deny allowlist on the program basename — same gate as spawn_action.
+    let allow = spawn_allowlist();
+    let prog_base = std::path::Path::new(&cmd[0])
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| cmd[0].clone());
+    if allow.is_empty() {
+        return Err(anyhow!("run denied: no programs allow-listed (set RDEV_SPAWN_ALLOW=<basenames>)"));
+    }
+    if !allow.contains(&prog_base) {
+        return Err(anyhow!("run denied: '{prog_base}' not in RDEV_SPAWN_ALLOW {allow:?}"));
+    }
+    // cwd confined to home + any path_prefix caveat — same gate as spawn_action.
+    let cwd = match &req.cwd {
+        Some(c) => {
+            if c.contains("..") {
+                return Err(anyhow!("path traversal not allowed"));
+            }
+            if let Some(prefix) = chain.last().and_then(|c| c.cap.caveats.path_prefix.as_ref()) {
+                if !prefix_admits(prefix, c) {
+                    return Err(anyhow!("cwd outside capability prefix '{prefix}'"));
+                }
+            }
+            home.join(c)
+        }
+        None => home.to_path_buf(),
+    };
+    std::fs::create_dir_all(&cwd).ok();
+
+    // Create the job dir.
+    let job_id = new_job_id();
+    let jdir = jobs_dir(home).join(&job_id);
+    std::fs::create_dir_all(&jdir).with_context(|| format!("create job dir {}", jdir.display()))?;
+    let log_path = jdir.join("log");
+    let status_path = jdir.join("status");
+
+    // Trim old jobs (best-effort) to bound disk use.
+    trim_jobs(home, MAX_RETAINED_JOBS);
+
+    // Build the wrapper that runs the command, then records "$?" to the status file so run/logs can
+    // report the exit code even after the process group is gone. The user command is passed as argv
+    // to `sh -c "$0" rdev-run <args…>` style — but to keep the exact tokens, we wrap the joined
+    // command. Tokens are shell-quoted to survive spaces/specials.
+    let joined = cmd.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+    let status_q = shell_quote(&status_path.to_string_lossy());
+    let wrapped = format!("{joined}; ec=$?; printf '%s' \"$ec\" > {status_q}; exit $ec");
+
+    let log_file = std::fs::File::create(&log_path).with_context(|| format!("create log {}", log_path.display()))?;
+    let log_err = log_file.try_clone().context("clone log handle for stderr")?;
+
+    let path_env = {
+        #[cfg(unix)]
+        let default_path = "/usr/bin:/bin";
+        #[cfg(windows)]
+        let default_path = "C:\\Windows\\System32;C:\\Windows";
+        std::env::var("PATH").unwrap_or_else(|_| default_path.to_string())
+    };
+
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(&wrapped)
+        .current_dir(&cwd)
+        .env_clear()
+        .env("PATH", path_env)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(log_err));
+    #[cfg(unix)]
+    command.env("HOME", &cwd);
+    #[cfg(windows)]
+    command.env("USERPROFILE", &cwd);
+    // Detach: put the child in its own process group/session so it survives the request returning
+    // and so run/kill can signal the whole group (children of the wrapper included).
+    detach(&mut command);
+
+    let child = command.spawn().with_context(|| format!("spawn run job '{}'", cmd[0]))?;
+    let pid = child.id() as i64;
+
+    let meta = JobMeta {
+        job_id: job_id.clone(),
+        pid,
+        cmd: cmd.clone(),
+        cwd: cwd.to_string_lossy().to_string(),
+        started_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
+    };
+    std::fs::write(jdir.join("meta.json"), serde_json::to_vec_pretty(&meta)?)
+        .with_context(|| format!("write meta for job {job_id}"))?;
+    // Reap the child from a detached thread. The job is already its own session/process group
+    // (setsid in `detach`), so it survives the request returning; this thread only calls `wait()`
+    // so the finished/killed child does not linger as a zombie. A zombie still answers `kill(pid,0)`
+    // as "alive", so without reaping a SIGKILLed job (which never writes the status file) would
+    // report `running:true` forever. Reaping makes `pid_alive` flip to false once it exits.
+    let mut child = child;
+    std::thread::Builder::new()
+        .name(format!("rdev-reap-{job_id}"))
+        .spawn(move || {
+            let _ = child.wait();
+        })
+        .ok();
+
+    Ok(Resp { ok: true, job_id: Some(job_id), ..Default::default() })
+}
+
+/// `rdev/run/logs`: read the job's logfile from `offset`, return the delta + liveness. Running iff
+/// the status file is absent AND the recorded pid is still alive; once the wrapper writes `status`,
+/// the job is done and we surface its exit code.
+fn run_logs(req: &Req, home: &Path) -> Result<RunLogsResp> {
+    let job_id = req.job_id.clone().ok_or_else(|| anyhow!("run/logs needs job_id"))?;
+    if job_id.contains('/') || job_id.contains('\\') || job_id.contains("..") {
+        return Err(anyhow!("bad job_id"));
+    }
+    let jdir = jobs_dir(home).join(&job_id);
+    if !jdir.is_dir() {
+        return Err(anyhow!("no such job '{job_id}'"));
+    }
+    let offset = req.offset.unwrap_or(0);
+    let log_path = jdir.join("log");
+    let (data, next_offset) = read_from(&log_path, offset)?;
+
+    let status_path = jdir.join("status");
+    let (running, exit_code) = match std::fs::read_to_string(&status_path) {
+        Ok(s) => (false, Some(s.trim().parse::<i64>().unwrap_or(-1))),
+        Err(_) => {
+            // No status yet: alive if the recorded pid is still running, else it died without
+            // recording a status (e.g. SIGKILL) — report not-running with an unknown (-1) code.
+            let meta: Option<JobMeta> =
+                std::fs::read(jdir.join("meta.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+            match meta {
+                Some(m) if pid_alive(m.pid) => (true, None),
+                Some(_) => (false, Some(-1)),
+                None => (false, Some(-1)),
+            }
+        }
+    };
+
+    Ok(RunLogsResp {
+        ok: true,
+        error: None,
+        data_hex: hex::encode(&data),
+        next_offset,
+        running,
+        exit_code,
+    })
+}
+
+/// `rdev/run/kill`: signal the job's process group. Idempotent — killing an already-dead or unknown
+/// job is a no-op success.
+fn run_kill(req: &Req, home: &Path) -> Result<Resp> {
+    let job_id = req.job_id.clone().ok_or_else(|| anyhow!("run/kill needs job_id"))?;
+    if job_id.contains('/') || job_id.contains('\\') || job_id.contains("..") {
+        return Err(anyhow!("bad job_id"));
+    }
+    let jdir = jobs_dir(home).join(&job_id);
+    let meta: Option<JobMeta> =
+        std::fs::read(jdir.join("meta.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    if let Some(m) = meta {
+        kill_group(m.pid);
+    }
+    Ok(Resp { ok: true, ..Default::default() })
+}
+
+/// Read bytes of `path` starting at `offset`; returns (bytes, new_offset). A missing file or an
+/// offset past EOF yields an empty delta (the log may not have been written to yet).
+fn read_from(path: &Path, offset: u64) -> Result<(Vec<u8>, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), offset)),
+        Err(e) => return Err(anyhow!("open log: {e}")),
+    };
+    let len = f.metadata()?.len();
+    if offset >= len {
+        return Ok((Vec::new(), len));
+    }
+    f.seek(SeekFrom::Start(offset))?;
+    let mut buf = Vec::with_capacity((len - offset) as usize);
+    f.read_to_end(&mut buf)?;
+    Ok((buf, len))
+}
+
+/// Quote a single shell argument for `sh -c` (single-quote, escaping embedded single quotes).
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Trim the jobs directory to at most `max` job dirs, removing the oldest (by meta `started_ms`,
+/// falling back to dir mtime) first. Best-effort: errors are ignored.
+fn trim_jobs(home: &Path, max: usize) {
+    let dir = jobs_dir(home);
+    let Ok(rd) = std::fs::read_dir(&dir) else { return };
+    let mut jobs: Vec<(u128, PathBuf)> = Vec::new();
+    for e in rd.flatten() {
+        let p = e.path();
+        if !p.is_dir() {
+            continue;
+        }
+        let started = std::fs::read(p.join("meta.json"))
+            .ok()
+            .and_then(|b| serde_json::from_slice::<JobMeta>(&b).ok())
+            .map(|m| m.started_ms)
+            .or_else(|| {
+                e.metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_millis())
+            })
+            .unwrap_or(0);
+        jobs.push((started, p));
+    }
+    if jobs.len() <= max {
+        return;
+    }
+    jobs.sort_by_key(|(t, _)| *t);
+    let remove = jobs.len() - max;
+    for (_, p) in jobs.into_iter().take(remove) {
+        let _ = std::fs::remove_dir_all(&p);
+    }
+}
+
+/// Put the child in its own process group/session so it is detached from the serve process and so a
+/// single signal to `-pid` reaches the whole job tree.
+#[cfg(unix)]
+fn detach(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: `setsid(2)` is async-signal-safe and is the standard way to detach into a new session
+    // in the post-fork/pre-exec child; it has no effect on the parent. No allocation, no locks.
+    unsafe {
+        command.pre_exec(|| {
+            // New session => new process group with the child as leader; detaches the controlling tty.
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn detach(_command: &mut std::process::Command) {
+    // On Windows the child already runs independently of the parent's lifetime for our purposes;
+    // process-group kill is approximated by killing the pid in `kill_group`.
+}
+
+/// True if a process with `pid` is currently alive.
+#[cfg(unix)]
+fn pid_alive(pid: i64) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // signal 0 = existence/permission probe; ESRCH => gone. EPERM (alive, not ours) counts as alive.
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if r == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn pid_alive(pid: i64) -> bool {
+    // Best-effort on non-unix: a status file is authoritative; absent that, assume not running.
+    let _ = pid;
+    false
+}
+
+/// Signal the job's whole process group (SIGTERM, then SIGKILL). `detach` made the child a session
+/// leader, so its pid is its process-group id; `kill(-pgid, …)` reaches the wrapper + its children.
+#[cfg(unix)]
+fn kill_group(pid: i64) {
+    if pid <= 0 {
+        return;
+    }
+    let pg = pid as libc::pid_t;
+    unsafe {
+        // Negative pid targets the process group led by `pid` (created via setsid in `detach`).
+        libc::kill(-pg, libc::SIGTERM);
+        libc::kill(pg, libc::SIGTERM);
+        libc::kill(-pg, libc::SIGKILL);
+        libc::kill(pg, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(pid: i64) {
+    let _ = pid; // Windows: best-effort no-op (a taskkill /T /F shell-out could be added if needed).
 }
 
 // ----- Auto-Sync v2 server-side verb handlers (rdev/sync2/*) -----
@@ -1880,5 +2463,213 @@ mod tests {
         let err = handle_inner("rdev/spawn", &hex::encode(mid.node_id()), &payload(&req), &host.node_id(), &[root.node_id()], &std::collections::HashSet::new(), &home).await.unwrap_err();
         assert!(err.to_string().contains("denied"));
         assert!(!home.join("pwn").exists());
+    }
+
+    // ----- run: long-lived detached HOST jobs with pollable live logs (rdev/run/*) -----
+
+    /// Poll `run/logs` until the job is no longer running (or a timeout), accumulating the full log.
+    /// Returns (full_log_bytes, exit_code).
+    fn drain_job(home: &Path, job_id: &str) -> (Vec<u8>, Option<i64>) {
+        let mut offset = 0u64;
+        let mut all = Vec::new();
+        for _ in 0..200 {
+            let req = Req { job_id: Some(job_id.to_string()), offset: Some(offset), ..Default::default() };
+            let r = run_logs(&req, home).unwrap();
+            assert!(r.ok);
+            let data = hex::decode(&r.data_hex).unwrap();
+            all.extend_from_slice(&data);
+            assert_eq!(r.next_offset, offset + data.len() as u64, "offset advances by delta length");
+            offset = r.next_offset;
+            if !r.running {
+                return (all, r.exit_code);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic!("job {job_id} did not finish in time");
+    }
+
+    #[test]
+    fn run_start_creates_jobdir_and_meta() {
+        allow_spawn();
+        let home = tmp_home("run-jobdir");
+        let chain: Vec<SignedCapability> = vec![];
+        let req = Req { cmd: Some(vec!["sh".into(), "-c".into(), "true".into()]), ..Default::default() };
+        let resp = run_start(&req, &chain, &home).unwrap();
+        assert!(resp.ok);
+        let job_id = resp.job_id.expect("job_id returned");
+        let jdir = jobs_dir(&home).join(&job_id);
+        assert!(jdir.is_dir(), "job dir created");
+        assert!(jdir.join("meta.json").exists(), "meta.json written");
+        let meta: JobMeta = serde_json::from_slice(&std::fs::read(jdir.join("meta.json")).unwrap()).unwrap();
+        assert_eq!(meta.job_id, job_id);
+        assert!(meta.pid > 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_logs_returns_deltas_and_exit_transition() {
+        allow_spawn();
+        let home = tmp_home("run-delta");
+        let chain: Vec<SignedCapability> = vec![];
+        // Emit a line, sleep, emit another, then exit 3 — exercises the offset deltas + exit capture.
+        let script = "echo first; sleep 1; echo done; exit 3";
+        let req = Req { cmd: Some(vec!["sh".into(), "-c".into(), script.into()]), ..Default::default() };
+        let job_id = run_start(&req, &chain, &home).unwrap().job_id.unwrap();
+        let (log, code) = drain_job(&home, &job_id);
+        let text = String::from_utf8_lossy(&log);
+        assert!(text.contains("first"), "log has first line: {text:?}");
+        assert!(text.contains("done"), "log has second line: {text:?}");
+        assert_eq!(code, Some(3), "captured exit code");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_logs_offset_reads_only_new_bytes() {
+        allow_spawn();
+        let home = tmp_home("run-offset");
+        let chain: Vec<SignedCapability> = vec![];
+        let req = Req { cmd: Some(vec!["sh".into(), "-c".into(), "echo hello".into()]), ..Default::default() };
+        let job_id = run_start(&req, &chain, &home).unwrap().job_id.unwrap();
+        // Let it finish.
+        let (full, _) = drain_job(&home, &job_id);
+        assert!(full.starts_with(b"hello"));
+        // Reading from an offset returns only the suffix; reading at EOF returns empty.
+        let mid = Req { job_id: Some(job_id.clone()), offset: Some(2), ..Default::default() };
+        let r = run_logs(&mid, &home).unwrap();
+        let suffix = hex::decode(&r.data_hex).unwrap();
+        assert_eq!(&full[2..], &suffix[..], "offset read returns the correct delta");
+        let eof = Req { job_id: Some(job_id), offset: Some(full.len() as u64), ..Default::default() };
+        let r = run_logs(&eof, &home).unwrap();
+        assert!(r.data_hex.is_empty(), "reading at EOF yields no bytes");
+    }
+
+    #[tokio::test]
+    async fn run_start_denied_for_non_allowlisted_program() {
+        allow_spawn(); // allows sh + true, NOT `echo`
+        let home = tmp_home("run-allow");
+        let host = id("run-allow-host");
+        let sender = id("run-allow-sender");
+        let token = cap(&host, sender.node_id(), &["spawn"], None, 0);
+        let req = Req { caps: token, cmd: Some(vec!["echo".into(), "hi".into()]), ..Default::default() };
+        let bytes = handle_run("rdev/run/start", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &[], &std::collections::HashSet::new(), &home).await;
+        let resp: Resp = serde_json::from_slice(&bytes).unwrap();
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap_or_default().contains("not in RDEV_SPAWN_ALLOW"));
+    }
+
+    #[tokio::test]
+    async fn run_start_denied_without_spawn_ability() {
+        let home = tmp_home("run-noability");
+        let host = id("run-noab-host");
+        let sender = id("run-noab-sender");
+        let token = cap(&host, sender.node_id(), &["sync"], None, 0); // no spawn
+        let req = Req { caps: token, cmd: Some(vec!["sh".into(), "-c".into(), "true".into()]), ..Default::default() };
+        let bytes = handle_run("rdev/run/start", &hex::encode(sender.node_id()), &payload(&req), &host.node_id(), &[], &std::collections::HashSet::new(), &home).await;
+        let resp: Resp = serde_json::from_slice(&bytes).unwrap();
+        assert!(!resp.ok);
+        assert!(resp.error.unwrap_or_default().contains("denied"));
+    }
+
+    #[test]
+    fn run_start_cwd_rejects_traversal() {
+        allow_spawn();
+        let home = tmp_home("run-trav");
+        let chain: Vec<SignedCapability> = vec![];
+        let req = Req { cmd: Some(vec!["sh".into(), "-c".into(), "true".into()]), cwd: Some("../evil".into()), ..Default::default() };
+        let err = run_start(&req, &chain, &home).unwrap_err();
+        assert!(err.to_string().contains("traversal"));
+    }
+
+    #[test]
+    fn run_start_cwd_enforces_path_prefix() {
+        allow_spawn();
+        let home = tmp_home("run-prefix");
+        let host = id("run-prefix-host");
+        let aud = id("run-prefix-aud");
+        let token = cap(&host, aud.node_id(), &["spawn"], Some("proj"), 0);
+        let chain = decode_chain(&token).unwrap();
+        // inside the prefix → ok
+        let inside = Req { cmd: Some(vec!["sh".into(), "-c".into(), "true".into()]), cwd: Some("proj".into()), ..Default::default() };
+        assert!(run_start(&inside, &chain, &home).unwrap().ok);
+        // outside → denied (sibling sharing a textual prefix must NOT be admitted)
+        let outside = Req { cmd: Some(vec!["sh".into(), "-c".into(), "true".into()]), cwd: Some("project-secret".into()), ..Default::default() };
+        assert!(run_start(&outside, &chain, &home).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_kill_stops_job_and_is_idempotent() {
+        allow_spawn();
+        let home = tmp_home("run-kill");
+        let chain: Vec<SignedCapability> = vec![];
+        // A long sleeper we will kill.
+        let req = Req { cmd: Some(vec!["sh".into(), "-c".into(), "sleep 30".into()]), ..Default::default() };
+        let job_id = run_start(&req, &chain, &home).unwrap().job_id.unwrap();
+        // It should be running first.
+        let probe = Req { job_id: Some(job_id.clone()), offset: Some(0), ..Default::default() };
+        // Give the wrapper a moment to be alive.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(run_logs(&probe, &home).unwrap().running, "job should be running before kill");
+        // Kill it.
+        let kreq = Req { job_id: Some(job_id.clone()), ..Default::default() };
+        assert!(run_kill(&kreq, &home).unwrap().ok);
+        // Idempotent: killing again is still ok.
+        assert!(run_kill(&kreq, &home).unwrap().ok);
+        // Eventually not running.
+        let mut stopped = false;
+        for _ in 0..100 {
+            if !run_logs(&probe, &home).unwrap().running {
+                stopped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(stopped, "job did not stop after kill");
+    }
+
+    #[test]
+    fn run_logs_unknown_job_errors() {
+        let home = tmp_home("run-unknown");
+        let req = Req { job_id: Some("deadbeefdeadbeef".into()), offset: Some(0), ..Default::default() };
+        assert!(run_logs(&req, &home).is_err());
+    }
+
+    #[test]
+    fn run_logs_rejects_bad_job_id() {
+        let home = tmp_home("run-badid");
+        let req = Req { job_id: Some("../escape".into()), offset: Some(0), ..Default::default() };
+        assert!(run_logs(&req, &home).is_err());
+        let kreq = Req { job_id: Some("a/b".into()), ..Default::default() };
+        assert!(run_kill(&kreq, &home).is_err());
+    }
+
+    #[test]
+    fn trim_jobs_caps_retained() {
+        let home = tmp_home("run-trim");
+        // Create 5 fake job dirs with increasing started_ms.
+        for i in 0..5u128 {
+            let jid = format!("job{i:02}");
+            let jdir = jobs_dir(&home).join(&jid);
+            std::fs::create_dir_all(&jdir).unwrap();
+            let meta = JobMeta { job_id: jid.clone(), pid: 1, cmd: vec![], cwd: String::new(), started_ms: i };
+            std::fs::write(jdir.join("meta.json"), serde_json::to_vec(&meta).unwrap()).unwrap();
+        }
+        trim_jobs(&home, 2);
+        let remaining: Vec<String> = std::fs::read_dir(jobs_dir(&home))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(remaining.len(), 2, "trimmed to cap");
+        // The two newest (job03, job04) survive.
+        assert!(remaining.contains(&"job03".to_string()));
+        assert!(remaining.contains(&"job04".to_string()));
+    }
+
+    #[test]
+    fn shell_quote_escapes_single_quotes() {
+        assert_eq!(shell_quote("simple"), "'simple'");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 }
