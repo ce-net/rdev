@@ -54,15 +54,22 @@ fn git_try(repo: &Path, args: &[&str]) -> Option<String> {
     if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { None }
 }
 
-/// All git repos directly under `root`, excluding `root` itself (it nests the others).
+/// Everything directly under `root` (excluding `root` itself, which nests the rest) is synced. Dirs
+/// that aren't git repos are AUTO-INITIALIZED so the whole workspace syncs by default — including
+/// plain folders like `notes/`. Hidden/dot dirs are skipped.
 fn discover_repos(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(root) {
         for e in rd.flatten() {
             let p = e.path();
-            if p.is_dir() && p.join(".git").exists() {
-                out.push(p);
+            if !p.is_dir() { continue; }
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.is_empty() || name.starts_with('.') { continue; }
+            if !p.join(".git").exists() {
+                let _ = git(&p, &["init", "-q"]);
+                let _ = git(&p, &["config", "core.fileMode", "false"]);
             }
+            if p.join(".git").exists() { out.push(p); }
         }
     }
     out.sort();
@@ -178,15 +185,25 @@ async fn recv_announce(client: &CeClient, peer: &Peer, payload_hex: &str, root: 
                     git(&repo, &["merge", "--ff-only", &incoming])?;
                     eprintln!("{}  pull {} <- {}: ff {}", now_str(), ann.repo, peer.name, &ann.head[..8.min(ann.head.len())]);
                 } else {
+                    // Diverged/unrelated. Try a clean merge; if it can't, last-writer-wins by commit
+                    // time so BOTH sides converge deterministically (no stuck conflict branches).
                     let m = git(&repo, &["-c", "user.name=ce-gitsync", "-c", "user.email=gitsync@ce-net",
-                        "merge", "--no-edit", "-m", &format!("merge {} into {host}", peer.name), &incoming]);
+                        "merge", "--no-edit", "--allow-unrelated-histories", "-m",
+                        &format!("merge {} into {host}", peer.name), &incoming]);
                     if m.is_ok() {
                         eprintln!("{}  pull {} <- {}: merged", now_str(), ann.repo, peer.name);
                     } else {
                         let _ = git(&repo, &["merge", "--abort"]);
-                        let cb = format!("ce-gitsync/conflict-{}-{}", peer.name, now_str());
-                        let _ = git(&repo, &["branch", "-f", &cb, &incoming]);
-                        eprintln!("{}  CONFLICT {} <- {}: kept local; peer on {cb}", now_str(), ann.repo, peer.name);
+                        let lt = git_try(&repo, &["log", "-1", "--format=%ct", "HEAD"]).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                        let it = git_try(&repo, &["log", "-1", "--format=%ct", &incoming]).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                        if it >= lt {
+                            let cb = format!("ce-gitsync/superseded-{}", now_str());
+                            let _ = git(&repo, &["branch", "-f", &cb, "HEAD"]); // keep ours, recoverable
+                            let _ = git(&repo, &["reset", "--hard", &incoming]);
+                            eprintln!("{}  pull {} <- {}: took newer {} (ours on {cb})", now_str(), ann.repo, peer.name, &ann.head[..8.min(ann.head.len())]);
+                        } else {
+                            eprintln!("{}  pull {} <- {}: kept ours (newer); peer adopts it", now_str(), ann.repo, peer.name);
+                        }
                     }
                 }
             }
@@ -238,6 +255,7 @@ pub async fn serve(client: CeClient, root: PathBuf, host: String) -> Result<()> 
     // that then conflict. Real edits are auto-committed only by the watcher path below.
     for repo in &repos {
         let _ = git(repo, &["config", "core.fileMode", "false"]); // mode noise isn't a "change"
+        auto_commit(repo, &host); // commit real (non-mode) content so existing/loose files sync too
         for peer in &peers { let _ = push_repo(&client, peer, repo, &root).await; }
     }
 
