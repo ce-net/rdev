@@ -92,10 +92,21 @@ struct Cli {
     cmd: Cmd,
 }
 
+mod gitsync;
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Run the server: accept rdev requests addressed to this node and perform them.
     Serve,
+    /// Real-time git sync of a workspace across your linked devices (event-driven, mesh-native).
+    Gitsync {
+        /// Workspace root (default: ~/ce-net)
+        #[arg(long)]
+        root: Option<std::path::PathBuf>,
+        /// This machine's short name in commits (default: $CE_GITSYNC_HOST or the hostname)
+        #[arg(long)]
+        host: Option<String>,
+    },
     /// Run a command in a sandboxed container on a peer: `rdev exec <target> --image rust -- cargo build`.
     Exec {
         target: String,
@@ -287,6 +298,16 @@ async fn main() -> Result<()> {
     }
     match cli.cmd {
         Cmd::Serve => serve(&client).await,
+        Cmd::Gitsync { root, host } => {
+            let root = root.unwrap_or_else(|| dirs_next::home_dir().unwrap_or_default().join("ce-net"));
+            let host = host.or_else(|| std::env::var("CE_GITSYNC_HOST").ok()).unwrap_or_else(|| {
+                std::process::Command::new("hostname").output().ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .map(|s| s.trim().split('.').next().unwrap_or("node").to_string())
+                    .unwrap_or_else(|| "node".into())
+            });
+            gitsync::serve(client, root, host).await
+        }
         Cmd::Exec { target, image, cwd, cap, command } => {
             exec(&client, &cfg, &target, image, cwd, cap, command).await
         }
