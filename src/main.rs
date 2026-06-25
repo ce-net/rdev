@@ -68,7 +68,10 @@ use walkdir::WalkDir;
 // The Auto-Sync v2 substrate (this crate's library half): chunking, delta, index, ignore, conflict
 // resolution, and the rdev/sync2/* wire types. The daemon below wires it to ce-rs transport.
 use rdev::chunk::chunk_bytes;
-use rdev::conflict::{ConflictInput, Policy, Resolution, resolve as resolve_conflict};
+use rdev::conflict::{
+    ConflictInput, Merge3, Policy, Resolution, is_conflict, is_mergeable_text, merge3,
+    resolve as resolve_conflict,
+};
 use rdev::delta::{apply_commit_verified, plan_transfer, upload_missing};
 use rdev::index::{Index, IndexEntry};
 use rdev::syncproto::{
@@ -796,7 +799,34 @@ async fn push_delta(
         mode,
         chunks: cf.manifest.chunks.clone(),
     });
-    if resp.conflict {
+    if resp.merged {
+        // A clean 3-way merge happened on the receiver. Pull the merged bytes so THIS side converges
+        // to the identical content — no conflict copy, nothing lost on either machine.
+        if let Some(rc) = &resp.remote_cid {
+            match client.get_blob(rc).await {
+                Ok(merged) => {
+                    let abs = root.join(rel);
+                    atomic_write(&abs, &merged)?;
+                    let (mcf, _) = chunk_bytes(&merged);
+                    let mt = std::fs::metadata(&abs)
+                        .ok()
+                        .map(|m| walk::mtime_ms(&m))
+                        .unwrap_or(resp.remote_mtime_ms);
+                    index.upsert(IndexEntry {
+                        rel_path: rel.to_string(),
+                        file_cid: mcf.file_cid.clone(),
+                        size: merged.len() as u64,
+                        mtime_ms: mt,
+                        mode,
+                        chunks: mcf.manifest.chunks.clone(),
+                    });
+                    index.set_remote_seen(rel, &mcf.file_cid, resp.remote_mtime_ms);
+                    println!("  ~ merged {rel} (converged both sides)");
+                }
+                Err(e) => println!("  ! merged {rel} on remote but pull failed: {e}"),
+            }
+        }
+    } else if resp.conflict {
         // Receiver kept its own version (or LWW chose it); record the remote's winning cid as base.
         if let Some(rc) = &resp.remote_cid {
             index.set_remote_seen(rel, rc, resp.remote_mtime_ms);
@@ -1634,8 +1664,12 @@ async fn handle_sync2_inner(
                 .as_deref()
                 .and_then(|s| s.parse::<Policy>().ok())
                 .unwrap_or(Policy::Lww);
-            let resolution = resolve_conflict(policy, &input);
-            // Make the committed bytes fetchable by file_cid too (so bidir pull can `get_blob` it).
+            let resolution = resolve_with_merge(client, policy, &input, &bytes, local_bytes.as_deref()).await;
+            // Make the committed bytes fetchable by file_cid (so bidir pull can `get_blob` it); and
+            // when we produced a 3-way merge, publish the merged bytes too so the initiator converges.
+            if let Resolution::Merged { merged } = &resolution {
+                let _ = client.put_blob(merged.clone()).await;
+            }
             let _ = client.put_blob(bytes.clone()).await;
 
             let resp = apply_resolution(&target, &req.path, &bytes, &local_bytes, resolution, local_cid.as_deref(), local_mtime)?;
@@ -1721,6 +1755,31 @@ async fn handle_sync2_inner(
     }
 }
 
+/// CRDT-aware conflict resolution. Only the `Crdt` policy attempts a real 3-way merge, and only for
+/// a genuine conflict on a registered text type where we have both sides plus a fetchable common
+/// ancestor. The merge needs the actual file bytes (I/O), so it lives here rather than in the pure
+/// `conflict::resolve`. Non-text, a missing ancestor, or overlapping same-region edits all fall back
+/// to LWW, which keeps a conflict copy — so this is never lossy.
+async fn resolve_with_merge(
+    client: &CeClient,
+    policy: Policy,
+    input: &ConflictInput<'_>,
+    incoming: &[u8],
+    local: Option<&[u8]>,
+) -> Resolution {
+    if policy == Policy::Crdt && is_conflict(input) && is_mergeable_text(input.rel_path) {
+        if let (Some(local), Some(base_cid)) = (local, input.base_cid.filter(|c| !c.is_empty())) {
+            if let Ok(base) = client.get_blob(base_cid).await {
+                if let Merge3::Clean(merged) = merge3(&base, local, incoming) {
+                    return Resolution::Merged { merged };
+                }
+            }
+        }
+        return resolve_conflict(Policy::Lww, input);
+    }
+    resolve_conflict(policy, input)
+}
+
 /// Apply a conflict resolution to disk and build the `commit` reply.
 fn apply_resolution(
     target: &Path,
@@ -1749,6 +1808,7 @@ fn apply_resolution(
                 conflict_copy: copy_rel,
                 remote_cid: None,
                 remote_mtime_ms: 0,
+                merged: false,
                 error: None,
             })
         }
@@ -1763,12 +1823,26 @@ fn apply_resolution(
                 conflict_copy: Some(conflict_copy),
                 remote_cid: local_cid.map(|s| s.to_string()),
                 remote_mtime_ms: local_mtime,
+                merged: false,
                 error: None,
             })
         }
         Resolution::Merged { merged } => {
+            // Clean 3-way merge: write the converged bytes and report THEIR cid so the initiator
+            // pulls the same bytes — both sides end identical, with no conflict copy (nothing lost).
+            let merged_cid = rdev::chunk::content_id(&merged);
             atomic_write(target, &merged)?;
-            Ok(CommitResp { ok: true, applied: true, ..Default::default() })
+            let mt = std::fs::metadata(target).ok().map(|m| walk::mtime_ms(&m)).unwrap_or(local_mtime);
+            Ok(CommitResp {
+                ok: true,
+                applied: true,
+                merged: true,
+                conflict: true,
+                remote_cid: Some(merged_cid),
+                remote_mtime_ms: mt,
+                conflict_copy: None,
+                error: None,
+            })
         }
     }
 }

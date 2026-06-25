@@ -32,6 +32,7 @@ walkdir = "2"
 notify = "6"
 toml = "0.8"
 bollard = "0.17"
+diffy = "0.4"   # 3-way text merge for the CRDT conflict policy (pure Rust, cross-compiles)
 
 # Unix-only: setsid (detach run-jobs into their own session/process group) + kill (group signal,
 # liveness probe). rdev/run/* uses these to detach long-lived host jobs and to kill the whole group.
