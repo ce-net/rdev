@@ -233,9 +233,11 @@ pub async fn serve(client: CeClient, root: PathBuf, host: String) -> Result<()> 
     })?;
     watcher.watch(&root, RecursiveMode::Recursive)?;
 
-    // Initial reconcile: announce every repo once (peers full-clone / fast-forward).
+    // Initial reconcile: announce every repo's COMMITTED head once. We do NOT auto-commit here —
+    // committing the just-started/just-cloned state on both sides creates divergent `live:` commits
+    // that then conflict. Real edits are auto-committed only by the watcher path below.
     for repo in &repos {
-        auto_commit(repo, &host);
+        let _ = git(repo, &["config", "core.fileMode", "false"]); // mode noise isn't a "change"
         for peer in &peers { let _ = push_repo(&client, peer, repo, &root).await; }
     }
 
