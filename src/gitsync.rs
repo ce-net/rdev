@@ -185,25 +185,25 @@ async fn recv_announce(client: &CeClient, peer: &Peer, payload_hex: &str, root: 
                     git(&repo, &["merge", "--ff-only", &incoming])?;
                     eprintln!("{}  pull {} <- {}: ff {}", now_str(), ann.repo, peer.name, &ann.head[..8.min(ann.head.len())]);
                 } else {
-                    // Diverged/unrelated. Try a clean merge; if it can't, last-writer-wins by commit
-                    // time so BOTH sides converge deterministically (no stuck conflict branches).
+                    // Diverged. Real line-by-line 3-way merge (git): non-overlapping edits to the
+                    // same OR different files combine cleanly — nothing is dropped.
                     let m = git(&repo, &["-c", "user.name=ce-gitsync", "-c", "user.email=gitsync@ce-net",
                         "merge", "--no-edit", "--allow-unrelated-histories", "-m",
                         &format!("merge {} into {host}", peer.name), &incoming]);
                     if m.is_ok() {
                         eprintln!("{}  pull {} <- {}: merged", now_str(), ann.repo, peer.name);
                     } else {
-                        let _ = git(&repo, &["merge", "--abort"]);
-                        let lt = git_try(&repo, &["log", "-1", "--format=%ct", "HEAD"]).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                        let it = git_try(&repo, &["log", "-1", "--format=%ct", &incoming]).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
-                        if it >= lt {
-                            let cb = format!("ce-gitsync/superseded-{}", now_str());
-                            let _ = git(&repo, &["branch", "-f", &cb, "HEAD"]); // keep ours, recoverable
-                            let _ = git(&repo, &["reset", "--hard", &incoming]);
-                            eprintln!("{}  pull {} <- {}: took newer {} (ours on {cb})", now_str(), ann.repo, peer.name, &ann.head[..8.min(ann.head.len())]);
-                        } else {
-                            eprintln!("{}  pull {} <- {}: kept ours (newer); peer adopts it", now_str(), ann.repo, peer.name);
-                        }
+                        // Genuine conflict (same lines changed on both, or two files independently
+                        // created at the same path). PRESERVE BOTH: commit the conflict markers so
+                        // NOTHING leaves the working tree — your editor shows both versions to
+                        // resolve. Peer's pure version also kept on a branch. Never deletes.
+                        let cb = format!("ce-gitsync/conflict-{}-{}", peer.name, now_str());
+                        let _ = git(&repo, &["branch", "-f", &cb, &incoming]);
+                        let _ = git(&repo, &["add", "-A"]);
+                        let _ = git(&repo, &["-c", "user.name=ce-gitsync", "-c", "user.email=gitsync@ce-net",
+                            "commit", "--no-verify", "-q", "-m",
+                            &format!("CONFLICT {} vs {host}: both versions kept inline — resolve <<< markers (peer on {cb})", peer.name)]);
+                        eprintln!("{}  CONFLICT {} <- {}: BOTH kept inline (<<< markers) + branch {cb} — nothing dropped", now_str(), ann.repo, peer.name);
                     }
                 }
             }
