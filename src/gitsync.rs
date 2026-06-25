@@ -9,6 +9,7 @@
 use anyhow::{Context, Result};
 use ce_rs::CeClient;
 use notify::{RecursiveMode, Watcher};
+use rdev::conflict::{is_mergeable_text, merge3, Merge3};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -20,8 +21,21 @@ const IGNORE: &[&str] = &[
     "/.git/", "/target/", "/target-", "/node_modules/", "/.cargo-shared/", "/.cargo/", "/dist/",
     "/build/", "/.next/", "/.svelte-kit/", "/.worktrees/", "/__pycache__/",
 ];
+// Loose content (files not in any git repo) is synced as plain files with our own 3-way merge — NOT
+// by making folders into repos. These path fragments are never synced (build output, caches, temps).
+const LOOSE_IGNORE: &[&str] = &[
+    "/.git", "/target", "/node_modules/", "/.cargo-shared/", "/.cargo/", "/dist/", "/build/",
+    "/.next/", "/.svelte-kit/", "/.worktrees/", "/__pycache__/", "/.ce-gitsync/", "/tmp/", "/trash/",
+    "/.cache/", "/.claude_tmp/", "/scratchpad/", "/.DS_Store",
+];
 const INLINE_MAX: usize = 2 * 1024 * 1024; // hex-inline bundles up to this; skip larger (initial
                                            // bulk is done via `git clone` from origin, see setup).
+
+#[derive(Serialize, Deserialize)]
+struct FileMsg {
+    rel: String,
+    content: String, // hex of the raw bytes
+}
 
 #[derive(Serialize, Deserialize)]
 struct Announce {
@@ -54,22 +68,16 @@ fn git_try(repo: &Path, args: &[&str]) -> Option<String> {
     if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { None }
 }
 
-/// Everything directly under `root` (excluding `root` itself, which nests the rest) is synced. Dirs
-/// that aren't git repos are AUTO-INITIALIZED so the whole workspace syncs by default — including
-/// plain folders like `notes/`. Hidden/dot dirs are skipped.
+/// Real git repos directly under `root` (excluding `root` itself, which nests them). We NEVER create
+/// repos — folders that aren't already git repos are loose content and sync via the file-merge layer.
 fn discover_repos(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(root) {
         for e in rd.flatten() {
             let p = e.path();
-            if !p.is_dir() { continue; }
-            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.is_empty() || name.starts_with('.') { continue; }
-            if !p.join(".git").exists() {
-                let _ = git(&p, &["init", "-q"]);
-                let _ = git(&p, &["config", "core.fileMode", "false"]);
+            if p.is_dir() && p.join(".git").exists() {
+                out.push(p);
             }
-            if p.join(".git").exists() { out.push(p); }
         }
     }
     out.sort();
@@ -228,48 +236,141 @@ fn recv_ack(peer: &Peer, payload_hex: &str, root: &Path) {
     }
 }
 
+// ---- Loose content: files NOT inside any git repo (notes/, AGENTS.md, …). Synced as plain files
+// with our own line-by-line 3-way merge. Each file's last-agreed bytes are kept as a "base" under
+// <root>/.ce-gitsync/base/<rel>; concurrent non-overlapping edits merge cleanly, same-region or binary
+// conflicts keep BOTH (a `.conflict-<peer>` copy) — never dropped. Temp/build/cache paths are excluded.
+
+fn is_loose_path(root: &Path, p: &Path) -> bool {
+    let s = p.to_string_lossy();
+    if LOOSE_IGNORE.iter().any(|seg| s.contains(seg)) { return false; }
+    p.starts_with(root) && p != root && repo_of(root, p).is_none()
+}
+
+fn loose_files(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let walker = walkdir::WalkDir::new(root).min_depth(1).into_iter().filter_entry(|e| {
+        let s = e.path().to_string_lossy();
+        if LOOSE_IGNORE.iter().any(|seg| s.contains(seg)) { return false; }
+        // prune sub-repo directories — their files sync via git, not here.
+        !(e.file_type().is_dir() && e.path().join(".git").exists())
+    });
+    for e in walker.flatten() {
+        if e.file_type().is_file() { out.push(e.path().to_path_buf()); }
+    }
+    out
+}
+
+fn rel_of(root: &Path, p: &Path) -> Option<String> {
+    p.strip_prefix(root).ok().map(|r| r.to_string_lossy().replace('\\', "/"))
+}
+fn base_for(root: &Path, rel: &str) -> PathBuf { root.join(".ce-gitsync/base").join(rel) }
+fn write_base(root: &Path, rel: &str, bytes: &[u8]) {
+    let bp = base_for(root, rel);
+    if let Some(d) = bp.parent() { let _ = std::fs::create_dir_all(d); }
+    let _ = std::fs::write(bp, bytes);
+}
+
+async fn push_file(client: &CeClient, peer: &Peer, root: &Path, rel: &str) {
+    let abs = root.join(rel);
+    let Ok(content) = std::fs::read(&abs) else { return };
+    if content.len() > INLINE_MAX { return; }
+    let msg = FileMsg { rel: rel.to_string(), content: hex::encode(&content) };
+    if let Ok(p) = serde_json::to_vec(&msg) {
+        let _ = client.send_message(&peer.node_id, "gitsync/file", &p).await;
+    }
+}
+
+/// Apply an incoming loose file. Returns Some(rel) when our copy changed (so we re-broadcast the
+/// merged result and every device converges); None when nothing changed or it was a kept-both conflict.
+fn apply_file(root: &Path, peer_name: &str, payload_hex: &str) -> Option<String> {
+    let raw = hex::decode(payload_hex).ok()?;
+    let msg: FileMsg = serde_json::from_slice(&raw).ok()?;
+    if msg.rel.contains("..") || msg.rel.starts_with('/') { return None; }
+    let abs = root.join(&msg.rel);
+    if !is_loose_path(root, &abs) { return None; }
+    let incoming = hex::decode(&msg.content).ok()?;
+    let local = std::fs::read(&abs).unwrap_or_default();
+    if local == incoming { write_base(root, &msg.rel, &incoming); return None; }
+    if !abs.exists() {
+        if let Some(d) = abs.parent() { let _ = std::fs::create_dir_all(d); }
+        let _ = std::fs::write(&abs, &incoming);
+        write_base(root, &msg.rel, &incoming);
+        eprintln!("{}  file {} <- {}: new", now_str(), msg.rel, peer_name);
+        return Some(msg.rel);
+    }
+    let base = std::fs::read(base_for(root, &msg.rel)).unwrap_or_default();
+    if is_mergeable_text(&msg.rel) {
+        if let Merge3::Clean(m) = merge3(&base, &local, &incoming) {
+            let _ = std::fs::write(&abs, &m);
+            write_base(root, &msg.rel, &m);
+            eprintln!("{}  file {} <- {}: merged (line-level)", now_str(), msg.rel, peer_name);
+            return Some(msg.rel);
+        }
+    }
+    // unmergeable (same region, or binary): keep BOTH — never overwrite local.
+    let copy = format!("{}.conflict-{}", msg.rel, peer_name);
+    let cabs = root.join(&copy);
+    if let Some(d) = cabs.parent() { let _ = std::fs::create_dir_all(d); }
+    let _ = std::fs::write(&cabs, &incoming);
+    eprintln!("{}  file {} <- {}: CONFLICT — kept both (peer's copy at {})", now_str(), msg.rel, peer_name, copy);
+    None
+}
+
 pub async fn serve(client: CeClient, root: PathBuf, host: String) -> Result<()> {
     let peers = load_peers();
     let repos = discover_repos(&root);
     eprintln!("{}  ce-gitsync(native) as {host}; root={}; repos={}; peers={:?}",
         now_str(), root.display(), repos.len(), peers.iter().map(|p| &p.name).collect::<Vec<_>>());
 
-    // Event-driven file watcher -> dirty repo set.
+    // Event-driven file watcher -> dirty repos + dirty loose files.
     let dirty: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
-    let (root2, dirty2) = (root.clone(), dirty.clone());
+    let dirty_files: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
+    let (root2, dirty2, df2) = (root.clone(), dirty.clone(), dirty_files.clone());
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(ev) = res {
             for p in ev.paths {
-                let s = p.to_string_lossy();
-                if IGNORE.iter().any(|seg| s.contains(seg)) { continue; }
                 if let Some(repo) = repo_of(&root2, &p) {
+                    let s = p.to_string_lossy();
+                    if IGNORE.iter().any(|seg| s.contains(seg)) { continue; }
                     dirty2.lock().unwrap().insert(repo);
+                } else if is_loose_path(&root2, &p) {
+                    df2.lock().unwrap().insert(p);
                 }
             }
         }
     })?;
     watcher.watch(&root, RecursiveMode::Recursive)?;
 
-    // Initial reconcile: announce every repo's COMMITTED head once. We do NOT auto-commit here —
-    // committing the just-started/just-cloned state on both sides creates divergent `live:` commits
-    // that then conflict. Real edits are auto-committed only by the watcher path below.
+    // Initial reconcile: push each repo's committed head, and every loose file, once.
     for repo in &repos {
         let _ = git(repo, &["config", "core.fileMode", "false"]); // mode noise isn't a "change"
-        auto_commit(repo, &host); // commit real (non-mode) content so existing/loose files sync too
+        auto_commit(repo, &host); // commit real (non-mode) WIP so it syncs
         for peer in &peers { let _ = push_repo(&client, peer, repo, &root).await; }
+    }
+    for f in loose_files(&root) {
+        if let Some(rel) = rel_of(&root, &f) {
+            for peer in &peers { push_file(&client, peer, &root, &rel).await; }
+        }
     }
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut last_hb = Instant::now();
     loop {
-        // 1) INSTANT: push only the repos the watcher flagged.
+        // 1) INSTANT: push repos + loose files the watcher flagged.
         let flagged: Vec<PathBuf> = { let mut d = dirty.lock().unwrap(); d.drain().collect() };
         for repo in flagged {
             if cur_branch(&repo).is_some() && auto_commit(&repo, &host) {
                 for peer in &peers { let _ = push_repo(&client, peer, &repo, &root).await; }
             }
         }
-        // 2) receive announces/acks from any peer.
+        let ff: Vec<PathBuf> = { let mut d = dirty_files.lock().unwrap(); d.drain().collect() };
+        for f in ff {
+            if let Some(rel) = rel_of(&root, &f) {
+                for peer in &peers { push_file(&client, peer, &root, &rel).await; }
+            }
+        }
+        // 2) receive announces/acks/files from any peer.
         if let Ok(msgs) = client.messages().await {
             let allowed: HashSet<&str> = peers.iter().map(|p| p.node_id.as_str()).collect();
             for m in msgs {
@@ -283,16 +384,25 @@ pub async fn serve(client: CeClient, root: PathBuf, host: String) -> Result<()> 
                     }
                 } else if m.topic == "gitsync/ack" {
                     recv_ack(peer, &m.payload_hex, &root);
+                } else if m.topic == "gitsync/file" {
+                    if let Some(rel) = apply_file(&root, &peer.name, &m.payload_hex) {
+                        for pe in &peers { push_file(&client, pe, &root, &rel).await; }
+                    }
                 }
             }
             if seen.len() > 4000 { seen.clear(); }
         }
-        // 3) heartbeat ~10s: re-announce all heads (no-op when the peer is current) — self-heals
-        //    dropped messages + discovers new repos. Cheap: rev-parse only, no full status scan.
+        // 3) heartbeat ~10s: re-push repo heads + loose files (no-op when already equal) — self-heals
+        //    dropped messages and discovers new repos/files.
         if last_hb.elapsed() > Duration::from_secs(10) {
             last_hb = Instant::now();
             for repo in discover_repos(&root) {
                 for peer in &peers { let _ = push_repo(&client, peer, &repo, &root).await; }
+            }
+            for f in loose_files(&root) {
+                if let Some(rel) = rel_of(&root, &f) {
+                    for peer in &peers { push_file(&client, peer, &root, &rel).await; }
+                }
             }
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
