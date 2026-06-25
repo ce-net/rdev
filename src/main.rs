@@ -2562,6 +2562,7 @@ mod tests {
         panic!("job {job_id} did not finish in time");
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_start_creates_jobdir_and_meta() {
         allow_spawn();
@@ -2644,6 +2645,7 @@ mod tests {
         assert!(resp.error.unwrap_or_default().contains("denied"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_start_cwd_rejects_traversal() {
         allow_spawn();
@@ -2654,6 +2656,7 @@ mod tests {
         assert!(err.to_string().contains("traversal"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn run_start_cwd_enforces_path_prefix() {
         allow_spawn();
