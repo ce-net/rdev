@@ -1,0 +1,39 @@
+# rdev — remote exec + content-addressed file sync over the CE mesh, installed and
+# supervised through the one `ce` binary. Install on every device with:
+#   ce app install rdev --on fleet=mine
+# Each device then runs `rdev serve` (the daemon) to accept capability-authed sync/exec.
+
+[app]
+name    = "rdev"
+version = "0.1.0"
+summary = "Remote exec + content-addressed file sync over the CE mesh"
+runtime = "native"
+publisher = "c0be11e0ce0aaa769da6f9970244947d3d32a0c0d8302fb5f41f73d7950be456"
+
+[native]
+bin = "rdev"
+[native.artifacts]
+# sha256 of each release binary, uploaded to ce-hub /blobs.
+"darwin-amd64" = "0d732e361264377b0cf6403cd970c43e5c08a03fb8f906ec8fd8a1f41db5162c"
+"linux-amd64"  = "8ac2364beddbd81f30446bef6bc8dc6bf16972c822a29cf92cc4aab94bff1275"
+
+[deps]
+# rdev's abilities: it runs sandboxed exec, host spawn, file sync/delete, and tunnels —
+# all capability-authed per request by the ce-cap verifier on the receiving node.
+capabilities = ["exec", "spawn", "sync", "delete", "tunnel"]
+system = { docker = "optional" }   # `rdev exec` uses gVisor/Docker when present; degrades without
+
+[sandbox]
+# rdev syncs HOST files and spawns HOST processes — it cannot run in a gVisor/runc jail
+# (that is the whole point of the tool). It talks to the LOCAL node over loopback for the
+# mesh transport (ce-rs AppRequest), and authorizes every inbound request via ce-cap.
+tier       = "none"        # explicit + audited; the host-access case
+net        = "loopback"    # mesh transport via the local node (127.0.0.1:8844)
+capability = "inherit"     # reuses the node wallet/caps for outbound; inbound is ce-cap-gated
+
+[daemon]
+# `rdev serve` accepts inbound rdev requests addressed to this node. Enabled so a
+# fleet-installed device is reachable for sync/exec without a manual start.
+enabled = true
+args    = ["serve"]
+restart = "on-failure"
