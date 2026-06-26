@@ -3,7 +3,7 @@ name = "rdev"
 version = "0.1.0"
 edition = "2024"
 description = "Remote-dev app on CE — exec + file sync/mirror over the mesh, gated by capabilities. An application built ON CE primitives, not part of the node."
-license = "MIT"
+license = "AGPL-3.0-only"
 repository = "https://github.com/ce-net/rdev"
 
 # rdev is both a reusable substrate library (the chunk/CID delta-sync engine that ce-pin and Notes
