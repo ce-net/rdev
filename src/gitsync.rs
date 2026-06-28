@@ -49,6 +49,14 @@ struct Ack {
     repo: String,
     head: String,
 }
+/// A working-tree SNAPSHOT delta (shadow-ref sync): the uncommitted working state, shipped without
+/// touching the branch. The peer materializes it as uncommitted changes, leaving its HEAD put.
+#[derive(Serialize, Deserialize)]
+struct Wip {
+    repo: String,
+    snap: String,   // the snapshot commit sha
+    bundle: String, // hex of the git bundle carrying refs/ce-gitsync/snap/<sender>
+}
 
 struct Peer {
     name: String,
@@ -120,12 +128,178 @@ fn get_ref(repo: &Path, r: &str) -> Option<String> {
 }
 fn set_ref(repo: &Path, r: &str, sha: &str) { let _ = git(repo, &["update-ref", r, sha]); }
 
-fn auto_commit(repo: &Path, host: &str) -> bool {
-    if !is_dirty(repo) { return false; }
-    if git(repo, &["add", "-A"]).is_err() { return false; }
+// ---- Shadow-ref WIP sync (the ONLY mode) --------------------------------------------------------
+// The old model auto-committed every save onto the WORKING BRANCH ("live: <host>" commits), so the
+// branch filled with noise, `git status` was always clean (you could never see your own diff or make a
+// real commit), and authorship was wrong. Instead we now NEVER touch the working branch: the uncommitted
+// working tree is snapshotted onto a parallel ref `refs/ce-gitsync/snap/<host>` (commit-tree — no branch
+// move, no index touch), shipped to peers, and materialized on the other machine as UNCOMMITTED
+// working-tree changes. Your branch + `git status` stay exactly as you left them; the real commits you
+// make still propagate through the (now noise-free) branch path. There is no legacy auto-commit mode —
+// gitsync NEVER writes to the working branch, full stop.
+fn snap_ref(host: &str) -> String { format!("refs/ce-gitsync/snap/{host}") }
+fn snap_head_ref(name: &str) -> String { format!("refs/ce-gitsync/snaphead/{name}") }
+fn applied_ref(name: &str) -> String { format!("refs/ce-gitsync/applied/{name}") }
+
+fn tree_of(repo: &Path, refish: &str) -> Option<String> {
+    git_try(repo, &["rev-parse", "--verify", "--quiet", &format!("{refish}^{{tree}}")]).filter(|s| !s.is_empty())
+}
+
+/// Tree sha of the CURRENT working tree (tracked + untracked, honouring .gitignore) WITHOUT touching the
+/// real index or HEAD — computed in a throwaway temp index.
+fn worktree_tree(repo: &Path) -> Option<String> {
+    let tmp = repo.join(".git/ce-gitsync.index");
+    let tmp_s = tmp.to_string_lossy().to_string();
+    let run = |args: &[&str]| -> Option<String> {
+        let o = Command::new("git").arg("-C").arg(repo).args(args)
+            .env("GIT_INDEX_FILE", &tmp_s).output().ok()?;
+        if o.status.success() { Some(String::from_utf8_lossy(&o.stdout).trim().to_string()) } else { None }
+    };
+    let res = (|| -> Option<String> {
+        match head(repo) {
+            Some(h) => { run(&["read-tree", h.as_str()])?; }
+            None => { run(&["read-tree", "--empty"])?; }
+        }
+        run(&["add", "-A"])?;
+        run(&["write-tree"]).filter(|s| !s.is_empty())
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    res
+}
+
+/// Capture the working tree onto snap_ref WITHOUT touching the branch/index. Returns the new snapshot sha
+/// if it advanced (something to sync), else None. When the tree is clean it snapshots HEAD's tree cheaply
+/// (so a peer-mirror clears to match after you make a real commit), avoiding the working-tree walk.
+fn snapshot(repo: &Path, host: &str) -> Option<String> {
+    let tree = if is_dirty(repo) { worktree_tree(repo)? } else { tree_of(repo, "HEAD")? };
+    let snap = snap_ref(host);
+    let prev = get_ref(repo, &snap);
+    if let Some(p) = &prev {
+        if tree_of(repo, p).as_deref() == Some(tree.as_str()) { return None; }
+    }
+    // Parent on the branch tip (HEAD), NOT the prior snapshot: the peer already has HEAD via the branch
+    // path, so a snapshot is a single commit and the delta a peer needs is just the working-tree changes
+    // (tiny). Chaining on prior snapshots instead would force a full-history bundle on first contact
+    // (over the inline cap) and the WIP would silently never sync.
+    let parent = head(repo);
     let msg = format!("live: {host} {}", now_str());
-    git(repo, &["-c", "user.name=ce-gitsync", "-c", "user.email=gitsync@ce-net",
-        "commit", "--no-verify", "-q", "-m", &msg]).is_ok()
+    let mut args: Vec<String> = vec![
+        "-c".into(), "user.name=ce-gitsync".into(), "-c".into(), "user.email=gitsync@ce-net".into(),
+        "commit-tree".into(), tree,
+    ];
+    if let Some(par) = &parent { args.push("-p".into()); args.push(par.clone()); }
+    args.push("-m".into()); args.push(msg);
+    let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let sha = git(repo, &argrefs).ok()?;
+    if sha.is_empty() { return None; }
+    set_ref(repo, &snap, &sha);
+    Some(sha)
+}
+
+async fn push_snapshot(client: &CeClient, peer: &Peer, repo: &Path, root: &Path, host: &str) -> Result<()> {
+    let snap = snap_ref(host);
+    let Some(sha) = get_ref(repo, &snap) else { return Ok(()) };
+    if get_ref(repo, &snap_head_ref(&peer.name)).as_deref() == Some(sha.as_str()) {
+        return Ok(()); // the peer already has this exact snapshot
+    }
+    let rel = repo.strip_prefix(root).unwrap_or(repo).to_string_lossy().to_string();
+    let tmp = std::env::temp_dir().join(format!("ce-gitsync-wip-{}-{}.bundle", peer.name, sha));
+    let tmp_s = tmp.to_string_lossy().to_string();
+    // The snapshot is parented on HEAD, and the peer has HEAD via the branch path — so exclude it for a
+    // tiny working-tree-only delta (full history would blow the inline cap and never send).
+    let made = if let Some(h) = head(repo) {
+        let neg = format!("^{h}");
+        git(repo, &["bundle", "create", &tmp_s, &neg, &snap]).is_ok()
+    } else {
+        git(repo, &["bundle", "create", &tmp_s, &snap]).is_ok()
+    };
+    if !made { return Ok(()); }
+    let bytes = std::fs::read(&tmp).unwrap_or_default();
+    let _ = std::fs::remove_file(&tmp);
+    if bytes.is_empty() || bytes.len() > INLINE_MAX {
+        if bytes.len() > INLINE_MAX {
+            eprintln!("{}  wip {rel} -> {}: {}B over inline cap; skipped", now_str(), peer.name, bytes.len());
+        }
+        return Ok(());
+    }
+    let wip = Wip { repo: rel.clone(), snap: sha.clone(), bundle: hex::encode(&bytes) };
+    client.send_message(&peer.node_id, "gitsync/wip", &serde_json::to_vec(&wip)?).await?;
+    // Mark sent so we don't re-ship the same snapshot every heartbeat (no ack for WIP).
+    set_ref(repo, &snap_head_ref(&peer.name), &sha);
+    eprintln!("{}  wip {rel} -> {}: {} ({}B)", now_str(), peer.name, &sha[..8.min(sha.len())], bytes.len());
+    Ok(())
+}
+
+async fn recv_wip(client: &CeClient, peer: &Peer, payload_hex: &str, root: &Path) -> Result<()> {
+    let _ = client; // symmetry with the other recv_* (no ack needed for WIP)
+    let raw = hex::decode(payload_hex)?;
+    let wip: Wip = serde_json::from_slice(&raw)?;
+    let repo = root.join(&wip.repo);
+    if !repo.join(".git").is_dir() { return Ok(()); } // the branch path creates/clones the repo first
+    let bytes = hex::decode(&wip.bundle)?;
+    let tmp = std::env::temp_dir().join(format!("ce-gitsync-wip-in-{}.bundle", &wip.snap));
+    std::fs::write(&tmp, &bytes)?;
+    let res = (|| -> Result<()> {
+        // A bundle can only be fetched by the ref NAMES it carries (a bare-sha refspec fails). Import the
+        // sender's snapshot refs (keeping their objects alive under snapraw/*), then pin our incoming ref.
+        let _ = git(&repo, &["fetch", "-q", &tmp.to_string_lossy(), "+refs/ce-gitsync/snap/*:refs/ce-gitsync/snapraw/*"]);
+        let inc = format!("refs/ce-gitsync/snapin/{}", peer.name);
+        let _ = git(&repo, &["update-ref", &inc, &wip.snap]);
+        if get_ref(&repo, &inc).as_deref() != Some(wip.snap.as_str()) {
+            anyhow::bail!("snapshot object {} not in bundle", &wip.snap[..8.min(wip.snap.len())]);
+        }
+        set_ref(&repo, &snap_head_ref(&peer.name), &wip.snap);
+        let st = tree_of(&repo, &wip.snap).context("snapshot tree")?;
+        let cur = worktree_tree(&repo);
+        if cur.as_deref() == Some(st.as_str()) {
+            set_ref(&repo, &applied_ref(&peer.name), &wip.snap); // already mirrored
+            return Ok(());
+        }
+        let applied_tree = get_ref(&repo, &applied_ref(&peer.name)).and_then(|a| tree_of(&repo, &a));
+        // Overwrite ONLY when the working tree is pristine, or is exactly the mirror we wrote last time —
+        // never the user's own un-synced edits (those are preserved; the incoming stays on snapin/<peer>).
+        let safe = !is_dirty(&repo) || (cur.is_some() && cur == applied_tree);
+        if safe {
+            git(&repo, &["read-tree", "--reset", "-u", &st])?; // working tree+index := snapshot tree
+            let _ = git(&repo, &["reset", "-q"]);              // index := HEAD => shows as unstaged changes
+            set_ref(&repo, &applied_ref(&peer.name), &wip.snap);
+            eprintln!("{}  wip {} <- {}: mirrored {}", now_str(), wip.repo, peer.name, &wip.snap[..8.min(wip.snap.len())]);
+        } else {
+            eprintln!("{}  wip {} <- {}: local edits present — kept yours", now_str(), wip.repo, peer.name);
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    res
+}
+
+/// Before applying a real BRANCH update, drop a peer-WIP mirror sitting uncommitted in the working tree
+/// (it would block ff/merge as "local changes"). Safe: it equals a snapshot we applied, never the user's
+/// own edits. No-op in legacy mode (no applied refs exist). Returns true if it reset.
+fn discard_mirror_if_safe(repo: &Path) -> bool {
+    if !is_dirty(repo) { return false; }
+    let Some(cur) = worktree_tree(repo) else { return false };
+    if let Some(refs) = git_try(repo, &["for-each-ref", "--format=%(refname)", "refs/ce-gitsync/applied"]) {
+        for r in refs.lines() {
+            if tree_of(repo, r).as_deref() == Some(cur.as_str()) {
+                let _ = git(repo, &["reset", "--hard", "-q", "HEAD"]);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Emit a repo's state to peers: real branch commits via the branch path, and (default) the uncommitted
+/// working tree via the shadow snapshot path. LEGACY restores the old auto-commit-onto-the-branch.
+async fn push_out(client: &CeClient, peers: &[Peer], repo: &Path, root: &Path, host: &str) {
+    // Shadow-ref ONLY: never commit to the working branch. We snapshot the working tree onto a parallel
+    // ref and ship (a) the real commits you deliberately made and (b) the uncommitted working-tree mirror.
+    snapshot(repo, host);
+    for peer in peers {
+        let _ = push_repo(client, peer, repo, root).await;       // real commits you deliberately made
+        let _ = push_snapshot(client, peer, repo, root, host).await; // uncommitted working-tree mirror
+    }
 }
 
 fn now_str() -> String {
@@ -189,6 +363,9 @@ async fn recv_announce(client: &CeClient, peer: &Peer, payload_hex: &str, root: 
             Some(lh) if lh == ann.head => {}
             Some(_) => {
                 if cur_branch(&repo).as_deref() != Some(ann.branch.as_str()) { return Ok(()); }
+                // A peer-WIP mirror sitting uncommitted would block the ff/merge as "local changes" — drop
+                // it (it's a snapshot we applied, not your own work; it re-mirrors after). No-op in legacy.
+                discard_mirror_if_safe(&repo);
                 if git(&repo, &["merge-base", "--is-ancestor", "HEAD", &incoming]).is_ok() {
                     git(&repo, &["merge", "--ff-only", &incoming])?;
                     eprintln!("{}  pull {} <- {}: ff {}", now_str(), ann.repo, peer.name, &ann.head[..8.min(ann.head.len())]);
@@ -342,11 +519,11 @@ pub async fn serve(client: CeClient, root: PathBuf, host: String) -> Result<()> 
     })?;
     watcher.watch(&root, RecursiveMode::Recursive)?;
 
-    // Initial reconcile: push each repo's committed head, and every loose file, once.
+    eprintln!("{}  gitsync: shadow-ref (working branch stays pristine; never auto-commits)", now_str());
+    // Initial reconcile: push each repo's branch + working-tree snapshot, and every loose file, once.
     for repo in &repos {
         let _ = git(repo, &["config", "core.fileMode", "false"]); // mode noise isn't a "change"
-        auto_commit(repo, &host); // commit real (non-mode) WIP so it syncs
-        for peer in &peers { let _ = push_repo(&client, peer, repo, &root).await; }
+        push_out(&client, &peers, repo, &root, &host).await;
     }
     for f in loose_files(&root) {
         if let Some(rel) = rel_of(&root, &f) {
@@ -360,8 +537,8 @@ pub async fn serve(client: CeClient, root: PathBuf, host: String) -> Result<()> 
         // 1) INSTANT: push repos + loose files the watcher flagged.
         let flagged: Vec<PathBuf> = { let mut d = dirty.lock().unwrap(); d.drain().collect() };
         for repo in flagged {
-            if cur_branch(&repo).is_some() && auto_commit(&repo, &host) {
-                for peer in &peers { let _ = push_repo(&client, peer, &repo, &root).await; }
+            if cur_branch(&repo).is_some() {
+                push_out(&client, &peers, &repo, &root, &host).await;
             }
         }
         let ff: Vec<PathBuf> = { let mut d = dirty_files.lock().unwrap(); d.drain().collect() };
@@ -382,6 +559,10 @@ pub async fn serve(client: CeClient, root: PathBuf, host: String) -> Result<()> 
                     if let Err(e) = recv_announce(&client, peer, &m.payload_hex, &root, &host).await {
                         eprintln!("{}  recv error: {e}", now_str());
                     }
+                } else if m.topic == "gitsync/wip" {
+                    if let Err(e) = recv_wip(&client, peer, &m.payload_hex, &root).await {
+                        eprintln!("{}  recv wip error: {e}", now_str());
+                    }
                 } else if m.topic == "gitsync/ack" {
                     recv_ack(peer, &m.payload_hex, &root);
                 } else if m.topic == "gitsync/file" {
@@ -397,7 +578,7 @@ pub async fn serve(client: CeClient, root: PathBuf, host: String) -> Result<()> 
         if last_hb.elapsed() > Duration::from_secs(10) {
             last_hb = Instant::now();
             for repo in discover_repos(&root) {
-                for peer in &peers { let _ = push_repo(&client, peer, &repo, &root).await; }
+                push_out(&client, &peers, &repo, &root, &host).await;
             }
             for f in loose_files(&root) {
                 if let Some(rel) = rel_of(&root, &f) {

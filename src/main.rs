@@ -88,8 +88,10 @@ struct Cli {
     /// Local CE node API URL (else config's node.url, else http://127.0.0.1:8844).
     #[arg(long, global = true)]
     node: Option<String>,
+    /// Optional: with no subcommand, rdev runs `serve` (daemon mode) — so the ce-appmgr supervisor can
+    /// launch it as the rdev ceapp's daemon even without passing args.
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 mod gitsync;
@@ -287,7 +289,7 @@ struct RunLogsResp {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    if let Cmd::Init = cli.cmd {
+    if let Some(Cmd::Init) = cli.cmd {
         return write_example_config();
     }
     let cfg = load_config();
@@ -296,7 +298,7 @@ async fn main() -> Result<()> {
     if !client.health().await.unwrap_or(false) {
         return Err(anyhow!("local CE node not reachable at {url} — is `ce start` running?"));
     }
-    match cli.cmd {
+    match cli.cmd.unwrap_or(Cmd::Serve) {
         Cmd::Serve => serve(&client).await,
         Cmd::Gitsync { root, host } => {
             let root = root.unwrap_or_else(|| dirs_next::home_dir().unwrap_or_default().join("ce-net"));
@@ -1013,10 +1015,50 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
 
 // ----- server -----
 
+/// Spawn the git-sync loop alongside `serve` when this machine is a dev-fleet node — it has the
+/// `~/ce-net` workspace AND at least one peer link. A no-op elsewhere (servers/relays), so the same
+/// fleet-installed rdev daemon is safe everywhere.
+fn maybe_spawn_gitsync(client: &CeClient) {
+    let Some(home) = dirs_next::home_dir() else { return };
+    let root = home.join("ce-net");
+    if !root.is_dir() {
+        return; // no workspace here
+    }
+    let has_peers = std::fs::read_to_string(home.join(".config/ce-link/links.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.as_array().map(|a| !a.is_empty()))
+        .unwrap_or(false);
+    if !has_peers {
+        return; // nothing to sync with
+    }
+    let host = std::env::var("CE_GITSYNC_HOST").ok().unwrap_or_else(|| {
+        std::process::Command::new("hostname")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().split('.').next().unwrap_or("dev").to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "dev".into())
+    });
+    let client = client.clone();
+    tokio::spawn(async move {
+        if let Err(e) = gitsync::serve(client, root, host).await {
+            eprintln!("gitsync exited: {e}");
+        }
+    });
+}
+
 async fn serve(client: &CeClient) -> Result<()> {
     let host_hex = client.status().await?.node_id;
     let host_id: [u8; 32] = hex::decode(&host_hex).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| anyhow!("bad node id"))?;
     let home = dirs_next::home_dir().unwrap_or_else(std::env::temp_dir);
+    // CONSOLIDATION: the one supervised rdev daemon ALSO runs git-sync on the dev fleet, so
+    // `ce app install rdev --on fleet=mine` gives sync + exec + live git-sync from a single ce-appmgr
+    // daemon — no separate launchd/systemd unit. Gated to machines that actually have the ~/ce-net
+    // workspace AND peer links (a no-op on servers/relays). The `gitsync` subcommand still exists for a
+    // manual run.
+    maybe_spawn_gitsync(client);
     // Accepted capability roots: chains rooted at any of these (or at this host's own key) are
     // honored. Empty by default (only self-issued caps). An org/fleet sets a shared root here so
     // a seed can delegate attenuated caps down a replication tree that every node accepts.
