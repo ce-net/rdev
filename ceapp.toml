@@ -5,7 +5,7 @@
 
 [app]
 name    = "rdev"
-version = "0.1.0"
+version = "0.2.0"
 summary = "Remote exec + content-addressed file sync over the CE mesh"
 runtime = "native"
 publisher = "c0be11e0ce0aaa769da6f9970244947d3d32a0c0d8302fb5f41f73d7950be456"

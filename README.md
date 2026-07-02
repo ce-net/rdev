@@ -14,11 +14,16 @@ No new node code, no new consensus tx, no stored IP:port. CE moves the bytes; rd
 ## Use
 
 ```bash
+# THE dev loop — one command in any ceapp directory (defaults read from ceapp.toml):
+rdev dev                        # watch -> rebuild -> restart -> stream output (local)
+rdev dev --via hetzner          # same loop, but build+run on a remote node over the mesh
+
 # On the target machine (its node already trusts you via a capability you hold):
 rdev serve
 
-# From your machine — push / delete a file on the target, over CE:
+# From your machine — push / pull / delete a file on the target, over CE:
 rdev push ./Cargo.toml <node-id>:proj/Cargo.toml --cap <token-from: ce grant ... --can sync,delete>
+rdev pull <target>:proj/target/release/myapp ./myapp    # chunk-level, CID-verified, mode kept
 rdev rm <node-id>:proj/Cargo.toml --cap <token>
 
 # Long-running remote run with LIVE logs (gated by the `spawn` ability, like `rdev spawn`):
@@ -27,6 +32,37 @@ rdev run <target> --cwd proj -- cargo build --release      # streams output live
 # One-command dogfooded build/test loop: content-addressed-sync a dir, then run there with live logs:
 rdev build <target> ./ce --remote ce -- cargo test --workspace
 ```
+
+## The dev loop (`rdev dev`)
+
+`rdev dev [dir]` is the one-command local development loop for a ceapp — the answer to "edit,
+build, deploy, test on a live domain takes minutes." It reads `ceapp.toml` and needs no config:
+the default build is `cargo build --bin <native.bin>` (plus `[build].features`), the default run
+is the built executable with `[daemon].args`. On every source change (debounced, `.ceignore`
+honored, `target/`/`.git` skipped) it rebuilds and restarts; a FAILING build never kills the
+running app — the previous process keeps serving until a build succeeds. Ctrl-C tears everything
+down.
+
+`rdev dev --via <target>` is the same loop with the heavy lifting elsewhere: the tree is
+content-addressed-synced to the target (only changed chunks move), the build and the app run on
+the target host (`spawn`-gated, allowlisted), and logs stream back live. The 4-core laptop never
+compiles.
+
+An optional rdev-owned `[dev]` section in `ceapp.toml` overrides any part (ce-appmgr ignores it,
+so manifests stay installable everywhere):
+
+```toml
+[dev]
+build       = "npm run build"      # custom build (sh -c); requires `run`
+run         = "npm run preview"    # custom run (sh -c)
+args        = ["serve", "--dev"]   # args for the default run (else [daemon].args)
+web         = "npm run dev"        # optional frontend dev process, spawned in web_dir
+web_dir     = "web"
+env         = { RUST_LOG = "debug" }
+debounce_ms = 400
+```
+
+Full doc: [`docs/dev-loop.md`](docs/dev-loop.md).
 
 `rdev run`/`rdev build` are the dogfooded distributed build/test loop: a 15–30 min `cargo build`
 runs on a beefy remote (e.g. the relay) with its output streamed back live, instead of bespoke

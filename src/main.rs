@@ -42,7 +42,11 @@
 //!     run/logs every ~700ms; Ctrl-C kills it). Gated by the `spawn` ability, like `spawn`.
 //!   - `rdev build <target> <dir> [--remote D] -- <cmd…>` — one-command dogfooded build/test loop:
 //!     `syncd --once` the dir to the target, then `run` the command there with live logs.
+//!   - `rdev dev [dir] [--via <target>]`  — the one-command ceapp dev loop: watch -> rebuild ->
+//!     restart -> stream output, defaults read from `ceapp.toml` (see `src/dev.rs`). With `--via`,
+//!     build+run happen on a remote node over the mesh; the local machine never compiles.
 //!   - `rdev push <file> <target:path>`   — push one file (whole-file, one-shot).
+//!   - `rdev pull <target:path> [out]`    — pull one file (chunk-level, CID-verified, mode kept).
 //!   - `rdev rm <target:path>`            — delete one file.
 //!   - `rdev syncd <dir> <target:dir>`    — continuous, content-addressed, resumable folder sync.
 //!   - `rdev watch <dir> <target:dir>`    — DEPRECATED alias for `rdev syncd --conflict lww`.
@@ -94,6 +98,7 @@ struct Cli {
     cmd: Option<Cmd>,
 }
 
+mod dev;
 mod gitsync;
 
 #[derive(Subcommand)]
@@ -197,6 +202,41 @@ enum Cmd {
         cap: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+    /// One-command dev loop for a ceapp: watch -> rebuild -> restart -> stream output.
+    ///
+    /// `rdev dev [dir]` reads `ceapp.toml` (defaults: `cargo build --bin <native.bin>`, run with
+    /// `[daemon].args`; an optional `[dev]` section overrides build/run/web/env). A failing build
+    /// never kills the running app. `--via <target>` runs the SAME loop with build+run on a remote
+    /// node over the mesh (content-addressed sync + live logs) — the local machine never compiles.
+    Dev {
+        /// App directory containing ceapp.toml (default: .)
+        dir: Option<PathBuf>,
+        /// Build+run on this target (config alias or 64-hex node id) instead of locally.
+        #[arg(long)]
+        via: Option<String>,
+        #[arg(long)]
+        cap: Option<String>,
+        /// Build with --release (default: debug, for fast iteration).
+        #[arg(long)]
+        release: bool,
+        /// Skip the [dev].web command.
+        #[arg(long)]
+        no_web: bool,
+    },
+    /// Pull ONE file from a peer over content-addressed sync: `rdev pull <target>:<path> [out]`.
+    ///
+    /// The counterpart of `push`: fetches the file's chunk manifest (`sync2/manifest`, gated by the
+    /// `sync-read` ability), pulls the chunks via the blob store, verifies the file CID, and writes
+    /// atomically (preserving the remote mode bits — a pulled binary stays executable). This is how
+    /// build artifacts come back from a remote `rdev build` without ssh/scp.
+    Pull {
+        /// `<target>:<remote-path>` (path relative to the remote home, as pushed/synced).
+        source: String,
+        /// Local output path (default: the remote file's basename in the cwd).
+        out: Option<PathBuf>,
+        #[arg(long)]
+        cap: Option<String>,
     },
     /// Write an example config to the config path.
     Init,
@@ -339,6 +379,11 @@ async fn main() -> Result<()> {
         Cmd::Build { target, localdir, remote, cap, command } => {
             build(&client, &cfg, &target, &localdir, remote, cap, command).await
         }
+        Cmd::Dev { dir, via, cap, release, no_web } => {
+            let dir = dir.unwrap_or_else(|| PathBuf::from("."));
+            dev::dev(&client, &cfg, &dir, via, cap, release, no_web).await
+        }
+        Cmd::Pull { source, out, cap } => pull(&client, &cfg, &source, out, cap).await,
         Cmd::Init => unreachable!(),
     }
 }
@@ -560,9 +605,9 @@ fn ok_reply(reply: Vec<u8>, msg: &str) -> Result<()> {
 // ----- legacy mirror helpers (the old whole-file `watch` is superseded by `syncd`; these small
 // pure helpers remain, exercised by unit tests and documenting the historic skip list) -----
 
-/// Legacy hard-coded skip predicate (superseded by `.ceignore` via `rdev::ceignore`). Retained for
-/// the `skip_rules` unit test and as documentation of the historic default ignore set.
-#[allow(dead_code)]
+/// Hard-coded skip predicate for a single file/dir name: the default ignore set (`SKIP`) plus
+/// editor droppings. `.ceignore` (via `rdev::ceignore`) is the user-facing mechanism; this is the
+/// belt-and-braces layer `rdev dev` applies on top (see `skip_any_component`).
 fn skip(name: &str) -> bool {
     SKIP.contains(&name) || name.ends_with('~') || name.ends_with(".swp") || name.ends_with(".tmp") || name.starts_with(".#")
 }
@@ -976,6 +1021,57 @@ async fn pull_one(
     });
     index.set_remote_seen(rel, &resp.file_cid, resp.mtime_ms);
     Ok(true)
+}
+
+/// `rdev pull <target>:<remote-path> [out]` — one-shot chunk-level pull of a single remote file.
+/// Fetches the manifest (`sync2/manifest`, `sync-read` ability), pulls chunks via the blob store,
+/// verifies the file CID, writes atomically, and restores the remote mode bits so pulled binaries
+/// stay executable. No index needed: a one-shot pull fetches every chunk.
+async fn pull(
+    client: &CeClient,
+    cfg: &Config,
+    source: &str,
+    out: Option<PathBuf>,
+    cap: Option<String>,
+) -> Result<()> {
+    let (target, rpath) = split_dest(source)?;
+    let (node_id, caps) = resolve(cfg, target, cap)?;
+    let rpath = remote_root_of(rpath);
+    if rpath.is_empty() {
+        return Err(anyhow!("pull needs a remote file path, e.g. {target}:proj/target/release/bin"));
+    }
+    let req = ManifestReq { caps: caps.clone(), path: rpath.clone() };
+    let reply = client.request(&node_id, verb::MANIFEST, &serde_json::to_vec(&req)?, 60_000).await?;
+    let resp: ManifestResp = serde_json::from_slice(&reply)?;
+    if !resp.ok {
+        return Err(anyhow!("manifest refused: {}", resp.error.unwrap_or_default()));
+    }
+    let Some(manifest) = resp.manifest.filter(|_| resp.found) else {
+        return Err(anyhow!("remote has no file at '{rpath}'"));
+    };
+    let (bytes, n_fetched) =
+        rdev::delta::pull_file_verified(client, &manifest, &resp.file_cid, &HashSet::new()).await?;
+    let out = out.unwrap_or_else(|| {
+        PathBuf::from(Path::new(&rpath).file_name().map(|s| s.to_owned()).unwrap_or_default())
+    });
+    if let Some(p) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(p).ok();
+    }
+    atomic_write(&out, &bytes)?;
+    #[cfg(unix)]
+    if resp.mode != 0 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&out, std::fs::Permissions::from_mode(resp.mode))
+            .with_context(|| format!("chmod {}", out.display()))?;
+    }
+    println!("pulled {rpath} -> {} ({} bytes, {n_fetched} chunks)", out.display(), bytes.len());
+    Ok(())
+}
+
+/// True when any component of `rel` is dev-loop noise: the default skip set (target/, .git,
+/// node_modules) or editor droppings. Used by `rdev dev` on top of the `.ceignore` matcher.
+fn skip_any_component(rel: &str) -> bool {
+    rel.split('/').any(|c| SKIP.contains(&c)) || skip(rel.rsplit('/').next().unwrap_or(rel))
 }
 
 fn strip_remote_root<'a>(remote_root: &str, path: &'a str) -> Option<&'a str> {
