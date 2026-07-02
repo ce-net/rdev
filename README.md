@@ -11,6 +11,14 @@ moves files between machines, authorized by capabilities, using only:
 
 No new node code, no new consensus tx, no stored IP:port. CE moves the bytes; rdev is the policy.
 
+> **FILE TRANSFER DISABLED (2026-07-02, by order).** The live sync destroyed a real working tree
+> (stale-peer apply after a history rewrite) and cross-node sync2 loses blobs mid-transfer, so every
+> file-copying surface — `push`, `rm`, `pull`, `syncd`, `watch`, `gitsync`, `build`, `dev --via`,
+> and the serving daemon's sync/sync2/gitsync — is refused until the protocol is hardened
+> (base-commit refusal, reliable chunk transport, refused-commit index fix). `exec`, `run`, `spawn`
+> and the **local `rdev dev` loop** (moves no files) are unaffected. `RDEV_DANGEROUS_SYNC=1` on both
+> ends is the protocol-development-only override. Remote builds: use `tools/ce-build` meanwhile.
+
 ## Use
 
 ```bash

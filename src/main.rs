@@ -341,6 +341,7 @@ async fn main() -> Result<()> {
     match cli.cmd.unwrap_or(Cmd::Serve) {
         Cmd::Serve => serve(&client).await,
         Cmd::Gitsync { root, host } => {
+            refuse_transfer("rdev gitsync")?;
             let root = root.unwrap_or_else(|| dirs_next::home_dir().unwrap_or_default().join("ce-net"));
             let host = host.or_else(|| std::env::var("CE_GITSYNC_HOST").ok()).unwrap_or_else(|| {
                 std::process::Command::new("hostname").output().ok()
@@ -353,9 +354,16 @@ async fn main() -> Result<()> {
         Cmd::Exec { target, image, cwd, cap, command } => {
             exec(&client, &cfg, &target, image, cwd, cap, command).await
         }
-        Cmd::Push { file, dest, cap } => push(&client, &cfg, &file, &dest, cap).await,
-        Cmd::Rm { dest, cap } => rm(&client, &cfg, &dest, cap).await,
+        Cmd::Push { file, dest, cap } => {
+            refuse_transfer("rdev push")?;
+            push(&client, &cfg, &file, &dest, cap).await
+        }
+        Cmd::Rm { dest, cap } => {
+            refuse_transfer("rdev rm")?;
+            rm(&client, &cfg, &dest, cap).await
+        }
         Cmd::Watch { dir, dest, cap } => {
+            refuse_transfer("rdev watch")?;
             // Back-compat shim: `watch` == `syncd --conflict lww` (push-only, watch).
             eprintln!("note: `rdev watch` is deprecated; use `rdev syncd`");
             let opts = SyncdOpts {
@@ -368,6 +376,7 @@ async fn main() -> Result<()> {
             syncd(&client, &cfg, &dir, &dest, cap, opts).await
         }
         Cmd::Syncd { dir, dest, cap, bidirectional, conflict, once, dry_run, debounce_ms } => {
+            refuse_transfer("rdev syncd")?;
             let conflict: Policy = conflict.parse()?;
             let opts = SyncdOpts { bidirectional, conflict, once, dry_run, debounce_ms };
             syncd(&client, &cfg, &dir, &dest, cap, opts).await
@@ -377,19 +386,71 @@ async fn main() -> Result<()> {
             run(&client, &node_id, &caps, cwd, command).await
         }
         Cmd::Build { target, localdir, remote, cap, command } => {
+            refuse_transfer("rdev build")?;
             build(&client, &cfg, &target, &localdir, remote, cap, command).await
         }
         Cmd::Dev { dir, via, cap, release, no_web } => {
+            if via.is_some() {
+                // `--via` syncs the tree to the remote — transfer, gated. The LOCAL loop is plain
+                // cargo + processes and moves no files; it stays available.
+                refuse_transfer("rdev dev --via")?;
+            }
             let dir = dir.unwrap_or_else(|| PathBuf::from("."));
             dev::dev(&client, &cfg, &dir, via, cap, release, no_web).await
         }
-        Cmd::Pull { source, out, cap } => pull(&client, &cfg, &source, out, cap).await,
+        Cmd::Pull { source, out, cap } => {
+            refuse_transfer("rdev pull")?;
+            pull(&client, &cfg, &source, out, cap).await
+        }
         Cmd::Init => unreachable!(),
     }
 }
 
 fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+// ----- file-transfer kill switch -----------------------------------------------------------------
+//
+// HARD KILL SWITCH (2026-07-02, Leif's order, verbatim: "rdev should NOT copy and transfer files
+// yet - its too unstable the live sync and its ruining work and overwriting stuff"): EVERY
+// file-transfer surface — the sync2 apply surface, gitsync, the legacy single-file `rdev/sync` +
+// `rdev/delete` topics, and every client command that copies files (`push`, `rm`, `pull`, `syncd`,
+// `watch`, `gitsync`, `build`, `dev --via`) — is DISABLED, on both the client and the serving daemon.
+//
+// Why: after the ce-cast history rewrite, a stale peer's sync materialized a pre-rewrite tree over a
+// live working copy (105 tracked files deleted from disk, foreign files written); cross-node sync2
+// commits fail blob resolution ("blob not found") mid-transfer; and a refused commit is still
+// recorded as synced in the client index (silent divergence, never retried). The protocol can
+// destroy work while being unable to even move it reliably. Until it gets (a) a base-commit sanity
+// check that REFUSES to apply a tree whose base the receiver has never seen, (b) working cross-node
+// chunk transport, and (c) the refused-commit index fix, rdev must not move files at all.
+//
+// exec/run/spawn (no file movement) and the LOCAL `rdev dev` loop (plain cargo + processes, no
+// transfer) are unaffected. Protocol work ONLY may re-enable with RDEV_DANGEROUS_SYNC=1 set on
+// BOTH ends; nothing in production sets it.
+
+/// The refusal every disabled surface returns. Loud and self-explaining on purpose.
+const SYNC_DISABLED_MSG: &str = "rdev file transfer is DISABLED (2026-07-02): the live sync destroyed a real working tree and cross-node sync2 loses blobs. It stays off until the protocol is fixed (base-commit refusal + reliable chunk transport + refused-commit index fix). exec/run and the local `rdev dev` loop still work. Protocol development only: RDEV_DANGEROUS_SYNC=1 on both ends.";
+
+/// True only when the protocol-development override is explicitly set.
+fn dangerous_sync_enabled() -> bool {
+    matches!(std::env::var("RDEV_DANGEROUS_SYNC").as_deref(), Ok("1") | Ok("true"))
+}
+
+/// Client-side gate: every file-copying command calls this first and dies with the explanation.
+fn refuse_transfer(what: &str) -> Result<()> {
+    if dangerous_sync_enabled() {
+        eprintln!("WARNING: {what} running with RDEV_DANGEROUS_SYNC=1 — protocol development only");
+        return Ok(());
+    }
+    Err(anyhow!("{what}: {SYNC_DISABLED_MSG}"))
+}
+
+/// Server-side: is this topic a file-transfer operation (refused while disabled)? Covers the
+/// legacy single-file verbs; the sync2 prefix is gated separately in the serve loop.
+fn is_transfer_topic(topic: &str) -> bool {
+    topic == "rdev/sync" || topic == "rdev/delete"
 }
 
 // ----- config / resolution -----
@@ -1149,19 +1210,22 @@ async fn serve(client: &CeClient) -> Result<()> {
     let host_hex = client.status().await?.node_id;
     let host_id: [u8; 32] = hex::decode(&host_hex).ok().and_then(|b| b.try_into().ok()).ok_or_else(|| anyhow!("bad node id"))?;
     let home = dirs_next::home_dir().unwrap_or_else(std::env::temp_dir);
-    // CONSOLIDATION: the one supervised rdev daemon ALSO runs git-sync on the dev fleet, so
-    // `ce app install rdev --on fleet=mine` gives sync + exec + live git-sync from a single ce-appmgr
-    // daemon — no separate launchd/systemd unit. Gated to machines that actually have the ~/ce-net
-    // workspace AND peer links (a no-op on servers/relays). The `gitsync` subcommand still exists for a
-    // manual run.
-    maybe_spawn_gitsync(client);
+    // File-transfer kill switch: the daemon no longer auto-runs gitsync (it wrote a stale peer's
+    // pre-rewrite tree over a live working copy). See SYNC_DISABLED_MSG; protocol work only may
+    // re-enable via RDEV_DANGEROUS_SYNC=1.
+    if dangerous_sync_enabled() {
+        eprintln!("WARNING: gitsync auto-spawn enabled via RDEV_DANGEROUS_SYNC=1 — protocol development only");
+        maybe_spawn_gitsync(client);
+    } else {
+        eprintln!("rdev: file transfer (sync/sync2 apply + gitsync) is DISABLED — {SYNC_DISABLED_MSG}");
+    }
     // Accepted capability roots: chains rooted at any of these (or at this host's own key) are
     // honored. Empty by default (only self-issued caps). An org/fleet sets a shared root here so
     // a seed can delegate attenuated caps down a replication tree that every node accepts.
     let roots = load_roots();
     let host_short = host_hex[..16].to_string();
     println!(
-        "rdev serving as {}… (rdev/sync, rdev/delete, rdev/exec, rdev/spawn, rdev/run/*, rdev/sync2/*) — {} configured root(s)",
+        "rdev serving as {}… (rdev/exec, rdev/spawn, rdev/run/* — file transfer sync/sync2/gitsync DISABLED) — {} configured root(s)",
         host_short,
         roots.len()
     );
@@ -1194,10 +1258,19 @@ async fn serve(client: &CeClient) -> Result<()> {
             // Auto-Sync v2 verbs return their own JSON shapes (not the generic `Resp`) and need the
             // node client (blob store) + the home tree state, so they are dispatched separately.
             let reply_bytes = if m.topic.starts_with(rdev::syncproto::TOPIC_PREFIX) {
-                handle_sync2(client, &m.topic, &m.from, &m.payload_hex, &host_id, &roots, &revoked, &home, &host_short).await
+                if dangerous_sync_enabled() {
+                    handle_sync2(client, &m.topic, &m.from, &m.payload_hex, &host_id, &roots, &revoked, &home, &host_short).await
+                } else {
+                    serde_json::to_vec(&serde_json::json!({ "ok": false, "error": SYNC_DISABLED_MSG }))
+                        .unwrap_or_default()
+                }
             } else if m.topic.starts_with("rdev/run/") {
                 // The run/* verbs have their own reply shapes (run/logs is RunLogsResp, not Resp).
                 handle_run(&m.topic, &m.from, &m.payload_hex, &host_id, &roots, &revoked, &home).await
+            } else if is_transfer_topic(&m.topic) && !dangerous_sync_enabled() {
+                // Legacy single-file write verbs are file transfer too — same kill switch.
+                let resp = Resp { ok: false, error: Some(SYNC_DISABLED_MSG.into()), ..Default::default() };
+                serde_json::to_vec(&resp).unwrap_or_default()
             } else {
                 let resp = handle(&m.topic, &m.from, &m.payload_hex, &host_id, &roots, &revoked, &home).await;
                 serde_json::to_vec(&resp).unwrap_or_default()
@@ -2907,5 +2980,47 @@ mod tests {
         assert_eq!(shell_quote("simple"), "'simple'");
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+}
+
+#[cfg(test)]
+mod sync_kill_switch_tests {
+    use super::*;
+
+    // NOTE: these two tests mutate process env, so they must not run concurrently with each
+    // other. `--test-threads` default is fine because both live in this one module and cargo
+    // runs same-module tests in one thread pool — the serial_guard mutex makes it explicit.
+    static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn file_transfer_is_refused_by_default() {
+        let _g = ENV_GUARD.lock().unwrap();
+        // Not set in the test env; the gate must refuse every file-copying surface.
+        unsafe { std::env::remove_var("RDEV_DANGEROUS_SYNC") };
+        assert!(!dangerous_sync_enabled());
+        for what in ["rdev syncd", "rdev push", "rdev pull", "rdev gitsync", "rdev dev --via"] {
+            let err = refuse_transfer(what).unwrap_err().to_string();
+            assert!(err.contains("DISABLED"), "refusal must carry the explanation: {err}");
+            assert!(err.contains("rdev dev"), "refusal must point at what still works: {err}");
+        }
+    }
+
+    #[test]
+    fn explicit_override_is_honored_for_protocol_work() {
+        let _g = ENV_GUARD.lock().unwrap();
+        unsafe { std::env::set_var("RDEV_DANGEROUS_SYNC", "1") };
+        assert!(dangerous_sync_enabled());
+        assert!(refuse_transfer("rdev syncd").is_ok());
+        unsafe { std::env::remove_var("RDEV_DANGEROUS_SYNC") };
+    }
+
+    #[test]
+    fn transfer_topics_cover_legacy_single_file_verbs() {
+        assert!(is_transfer_topic("rdev/sync"));
+        assert!(is_transfer_topic("rdev/delete"));
+        // sync2 is gated by its own prefix branch in the serve loop; exec/run stay open.
+        assert!(!is_transfer_topic("rdev/exec"));
+        assert!(!is_transfer_topic("rdev/spawn"));
+        assert!(!is_transfer_topic("rdev/run/start"));
     }
 }

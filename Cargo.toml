@@ -1,6 +1,6 @@
 [package]
 name = "rdev"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "Remote-dev app on CE — exec + file sync/mirror over the mesh, gated by capabilities. An application built ON CE primitives, not part of the node."
 license = "AGPL-3.0-only"

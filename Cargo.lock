@@ -662,6 +662,7 @@ dependencies = [
  "hex",
  "rand 0.8.6",
  "serde",
+ "sha2",
 ]
 
 [[package]]
@@ -684,6 +685,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ce-microvm"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ce-runtime",
+ "hex",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ce-node"
 version = "0.1.0"
 dependencies = [
@@ -698,6 +711,7 @@ dependencies = [
  "ce-guard",
  "ce-identity",
  "ce-mesh",
+ "ce-microvm",
  "ce-protocol",
  "ce-runtime",
  "ce-tls",
@@ -3934,7 +3948,7 @@ dependencies = [
 
 [[package]]
 name = "rdev"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bincode",

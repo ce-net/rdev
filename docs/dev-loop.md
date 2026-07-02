@@ -1,5 +1,9 @@
 # The ceapp dev loop — `rdev dev`
 
+> STATUS (2026-07-02): the LOCAL loop below is fully available. `--via` (and `rdev pull`) are
+> DISABLED with the rest of rdev file transfer until the sync protocol is hardened — see the
+> README banner. Remote builds go through `tools/ce-build` meanwhile.
+
 One command to develop any ceapp: watch the sources, rebuild on change, restart the app, stream
 its output. Locally by default; on a beefy remote node with `--via`. This is the tool the
 2026-06-25 dev-environment review named the single highest-leverage missing piece ("no `ce-app
