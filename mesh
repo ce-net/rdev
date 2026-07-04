@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# mesh — one command = one supervised CE node + live sync. No port wrangling, no stray nodes.
+#
+#   mesh up        bring up exactly one node + sync (idempotent; kills strays, supervised, auto-restart)
+#   mesh down      stop the node + sync
+#   mesh status    node health, relay link, sync state, peers
+#   mesh pair      print a short pairing code (this device hosts)
+#   mesh pair CODE join a device that printed a code (scoped, signed, verified)
+#
+# Security: pairing issues a signed, scoped capability via the relay rendezvous — never a raw key,
+# never a long paste. Each link is verified (peer identity) and scoped (sync only, expiring).
+set -euo pipefail
+
+API=127.0.0.1:8844
+BIN="$HOME/.local/bin"
+CE="$BIN/ce"
+RDEV="$BIN/rdev"
+OS="$(uname -s)"
+
+log() { printf '\033[36mmesh\033[0m %s\n' "$*"; }
+err() { printf '\033[31mmesh\033[0m %s\n' "$*" >&2; }
+
+node_up() {
+  command -v "$CE" >/dev/null || { err "ce not installed at $CE"; exit 1; }
+  # SINGLE INSTANCE: clear any stray nodes squatting the API port (the bug that bit us all night).
+  pkill -9 -f 'ce start' 2>/dev/null || true
+  if command -v lsof >/dev/null; then lsof -ti tcp:8844 2>/dev/null | xargs -r kill -9 2>/dev/null || true; fi
+  sleep 1
+  if [ "$OS" = Darwin ]; then
+    local plist="$HOME/Library/LaunchAgents/com.ce-net.node.plist"
+    cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+ <key>Label</key><string>com.ce-net.node</string>
+ <key>ProgramArguments</key><array><string>$CE</string><string>start</string><string>--light</string></array>
+ <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+ <key>StandardOutPath</key><string>/tmp/ce-node.log</string><key>StandardErrorPath</key><string>/tmp/ce-node.log</string>
+</dict></plist>
+EOF
+    launchctl bootout "gui/$(id -u)/com.ce-net.node" 2>/dev/null || true
+    launchctl load "$plist"
+  else
+    mkdir -p "$HOME/.config/systemd/user"
+    cat > "$HOME/.config/systemd/user/ce-node.service" <<EOF
+[Unit]
+Description=CE node (supervised)
+After=network.target
+[Service]
+ExecStartPre=-/bin/sh -c 'pkill -9 -f "ce start"; sleep 1'
+ExecStart=$CE start --light
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable --now ce-node 2>/dev/null || systemctl --user restart ce-node
+    loginctl enable-linger "$(id -un)" 2>/dev/null || true
+  fi
+}
+
+sync_up() {
+  [ -x "$RDEV" ] || { log "sync engine (rdev) not present — node only"; return; }
+  if [ "$OS" = Darwin ]; then
+    local plist="$HOME/Library/LaunchAgents/com.ce-net.sync.plist"
+    cat > "$plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+ <key>Label</key><string>com.ce-net.sync</string>
+ <key>ProgramArguments</key><array><string>$RDEV</string><string>gitsync</string></array>
+ <key>RunAtLoad</key><true/><key>KeepAlive</key><true/>
+ <key>StandardOutPath</key><string>/tmp/ce-sync.log</string><key>StandardErrorPath</key><string>/tmp/ce-sync.log</string>
+</dict></plist>
+EOF
+    launchctl bootout "gui/$(id -u)/com.ce-net.sync" 2>/dev/null || true
+    launchctl load "$plist"
+  else
+    cat > "$HOME/.config/systemd/user/ce-sync.service" <<EOF
+[Unit]
+Description=CE workspace sync
+After=ce-node.service
+[Service]
+ExecStart=$RDEV gitsync
+Restart=always
+RestartSec=3
+[Install]
+WantedBy=default.target
+EOF
+    systemctl --user daemon-reload
+    systemctl --user enable --now ce-sync 2>/dev/null || systemctl --user restart ce-sync
+  fi
+}
+
+wait_node() {
+  for _ in $(seq 1 20); do
+    curl -fsS -m3 "http://$API/status" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+cmd_up() {
+  log "bringing up node…"; node_up
+  if wait_node; then
+    local h; h=$(curl -s -m3 "http://$API/status" 2>/dev/null | sed -n 's/.*"height":\([0-9]*\).*/\1/p')
+    log "node up (height ${h:-?})"
+  else err "node did not come up — see /tmp/ce-node.log"; exit 1; fi
+  log "starting sync…"; sync_up
+  log "up. one node, supervised, auto-restart. 'mesh status' to check, 'mesh pair' to link a device."
+}
+
+cmd_down() {
+  if [ "$OS" = Darwin ]; then
+    launchctl bootout "gui/$(id -u)/com.ce-net.sync" 2>/dev/null || true
+    launchctl bootout "gui/$(id -u)/com.ce-net.node" 2>/dev/null || true
+  else
+    systemctl --user disable --now ce-sync ce-node 2>/dev/null || true
+  fi
+  pkill -9 -f 'ce start' 2>/dev/null || true
+  log "down."
+}
+
+cmd_status() {
+  local s; s=$(curl -s -m3 "http://$API/status" 2>/dev/null || true)
+  if [ -z "$s" ]; then echo "node:  DOWN (run: mesh up)"; else
+    echo "node:  up  height=$(echo "$s" | sed -n 's/.*"height":\([0-9]*\).*/\1/p')  id=$(echo "$s" | sed -n 's/.*"node_id":"\([0-9a-f]\{12\}\).*/\1/p')…"
+  fi
+  # relay reservation = the circuit listen addr in the node log
+  if grep -q 'relay circuit listening' /tmp/ce-node.log 2>/dev/null; then echo "relay: connected (circuit reserved)"; else echo "relay: NOT reserved (not dialable)"; fi
+  if pgrep -f 'rdev gitsync' >/dev/null 2>&1 || systemctl --user is-active ce-sync >/dev/null 2>&1; then echo "sync:  active"; else echo "sync:  off"; fi
+}
+
+case "${1:-status}" in
+  up) cmd_up ;;
+  down) cmd_down ;;
+  status) cmd_status ;;
+  pair) shift; exec "$RDEV" pair "$@" ;;   # pairing lives in the sync tool (built next)
+  *) echo "usage: mesh {up|down|status|pair [CODE]}"; exit 1 ;;
+esac

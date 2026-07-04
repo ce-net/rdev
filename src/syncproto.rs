@@ -94,6 +94,11 @@ pub struct CommitResp {
     /// If a conflict copy was written on the receiver, its relative path.
     #[serde(default)]
     pub conflict_copy: Option<String>,
+    /// True when the receiver produced a clean 3-way MERGE (CRDT policy). In that case `remote_cid`
+    /// is the merged file's CID: the initiator pulls it so BOTH sides converge to the merged bytes
+    /// (no conflict copy — nothing was lost). Distinguishes a real merge from an LWW kept-local.
+    #[serde(default)]
+    pub merged: bool,
 }
 
 /// `rdev/sync2/delete` request — tombstone a path (idempotent).

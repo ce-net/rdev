@@ -106,10 +106,11 @@ pub fn resolve(policy: Policy, input: &ConflictInput) -> Resolution {
             conflict_copy: conflict_copy_name(input.rel_path, input.initiator_short, input.incoming_mtime_ms),
         },
         Policy::Crdt => {
-            // TODO(M5): if rel_path's extension is registered (.md/.txt/.note), call the shared
-            // TextDoc::merge(base, local, remote) engine (co-developed with Notes) and return
-            // Resolution::Merged. Until that engine lands, CRDT degrades to LWW so M1-M4 ship
-            // independently (per the design's "gate CRDT behind a TextDoc trait" mitigation).
+            // The actual 3-way merge needs the file BYTES (base/local/incoming), which is I/O — so
+            // it can't happen in this pure decision function. The commit handler attempts
+            // `merge3()` for registered text types BEFORE calling `resolve`, and only reaches this
+            // arm when the merge wasn't applicable (non-text, missing ancestor, or overlapping
+            // edits). In all those cases LWW is the right, lossless fallback (keeps a conflict copy).
             lww(input)
         }
         Policy::Lww => lww(input),
@@ -166,6 +167,66 @@ pub fn conflict_copy_name(rel_path: &str, short: &str, mtime_ms: u64) -> String 
     match dir {
         Some(d) => format!("{d}/{renamed}"),
         None => renamed,
+    }
+}
+
+/// Outcome of a 3-way text merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Merge3 {
+    /// Non-overlapping concurrent edits merged cleanly into these bytes.
+    Clean(Vec<u8>),
+    /// Both sides changed the same region — caller falls back to LWW (which keeps both via a
+    /// conflict copy, so still lossless).
+    Conflict,
+    /// One of the three inputs wasn't valid UTF-8 — not a text file, don't merge.
+    NotText,
+}
+
+/// File extensions whose conflicts are safe to merge as line-oriented text. Anything not listed
+/// (binaries, images, archives) falls back to LWW so we never interleave non-text bytes.
+pub fn is_mergeable_text(rel_path: &str) -> bool {
+    const EXTS: &[&str] = &[
+        // code
+        "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "py", "go", "java", "kt", "swift", "rb",
+        "php", "c", "h", "cc", "cpp", "hpp", "cs", "scala", "lua", "ex", "exs", "dart", "sh",
+        "bash", "zsh", "sql", "r", "pl", "m",
+        // prose / docs
+        "md", "markdown", "txt", "rst", "adoc", "tex", "org",
+        // config / data
+        "toml", "yaml", "yml", "json", "jsonc", "ini", "cfg", "conf", "env", "properties",
+        // web
+        "html", "htm", "css", "scss", "sass", "less", "xml", "svg", "vue", "svelte",
+        // dotfiles-as-extension
+        "gitignore", "ceignore", "dockerignore", "editorconfig", "gitattributes",
+    ];
+    let name = rel_path.rsplit('/').next().unwrap_or(rel_path);
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => EXTS.contains(&ext.to_ascii_lowercase().as_str()),
+        // Leading-dot dotfile like ".gitignore": treat the name-after-the-dot as the type.
+        _ => name
+            .strip_prefix('.')
+            .map(|n| EXTS.contains(&n.to_ascii_lowercase().as_str()))
+            .unwrap_or(false),
+    }
+}
+
+/// Three-way merge: reconcile `local` and `incoming` against their common ancestor `base`.
+/// Non-overlapping concurrent edits converge into one file; edits to the same region report
+/// [`Merge3::Conflict`]. This is the git-style merge — exactly what you want when two machines edit
+/// one tree: a change to the top of a file and a change to the bottom merge automatically, and only
+/// genuine same-line collisions need fallback handling.
+pub fn merge3(base: &[u8], local: &[u8], incoming: &[u8]) -> Merge3 {
+    let (b, ours, theirs) = match (
+        std::str::from_utf8(base),
+        std::str::from_utf8(local),
+        std::str::from_utf8(incoming),
+    ) {
+        (Ok(b), Ok(o), Ok(t)) => (b, o, t),
+        _ => return Merge3::NotText,
+    };
+    match diffy::merge(b, ours, theirs) {
+        Ok(merged) => Merge3::Clean(merged.into_bytes()),
+        Err(_) => Merge3::Conflict,
     }
 }
 
@@ -272,5 +333,52 @@ mod tests {
         // dotfile is not split on its leading dot
         let n3 = conflict_copy_name(".bashrc", "abc123", 2000);
         assert_eq!(n3, ".bashrc.conflict-abc123-2");
+    }
+
+    #[test]
+    fn merge3_non_overlapping_edits_converge() {
+        // base, then each side edits a DIFFERENT line — a clean 3-way merge.
+        let base = b"line1\nline2\nline3\n";
+        let local = b"LINE1\nline2\nline3\n"; // edited the first line
+        let incoming = b"line1\nline2\nLINE3\n"; // edited the last line
+        match merge3(base, local, incoming) {
+            Merge3::Clean(m) => {
+                let s = String::from_utf8(m).unwrap();
+                assert!(s.contains("LINE1"), "kept local edit: {s}");
+                assert!(s.contains("LINE3"), "kept incoming edit: {s}");
+            }
+            other => panic!("expected Clean, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn merge3_same_line_collision_is_conflict() {
+        let base = b"hello\n";
+        let local = b"hello local\n";
+        let incoming = b"hello remote\n";
+        assert_eq!(merge3(base, local, incoming), Merge3::Conflict);
+    }
+
+    #[test]
+    fn merge3_identical_sides_is_clean() {
+        let base = b"a\nb\n";
+        let same = b"a\nB\n";
+        assert!(matches!(merge3(base, same, same), Merge3::Clean(_)));
+    }
+
+    #[test]
+    fn merge3_non_utf8_is_not_text() {
+        let bin = &[0xff, 0xfe, 0x00, 0x01][..];
+        assert_eq!(merge3(b"base", bin, b"x"), Merge3::NotText);
+    }
+
+    #[test]
+    fn mergeable_text_extensions() {
+        for p in ["a.rs", "src/b.ts", "C.MD", "deep/dir/x.toml", ".gitignore", "ce/.ceignore", "n.py"] {
+            assert!(is_mergeable_text(p), "{p} should be mergeable");
+        }
+        for p in ["logo.png", "a.bin", "archive.tar", "data.sqlite", "noext", "x.exe"] {
+            assert!(!is_mergeable_text(p), "{p} should NOT be mergeable");
+        }
     }
 }
