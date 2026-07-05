@@ -51,8 +51,11 @@
 //!   - `rdev syncd <dir> <target:dir>`    — continuous, content-addressed, resumable folder sync.
 //!   - `rdev watch <dir> <target:dir>`    — DEPRECATED alias for `rdev syncd --conflict lww`.
 //!
-//! A `target` is a config alias or a 64-hex node id; the capability comes from the alias's `cap`
-//! (or `--cap`). `rdev serve` consults the node's on-chain revoked set (refreshed periodically) and
+//! A `target` is a 64-hex node id, an rdev config alias, or an alias in the SHARED ce wallet. The
+//! capability is resolved in that order of preference: `--cap` > rdev config alias > the shared ce
+//! node wallet (`<data_dir>/wallet.toml`) — so a cap you already hold via `ce wallet add` works here
+//! with no `--cap` and no rdev-private cap store (PLAN/ce-iam-store-unification.md: one wallet for
+//! every app). `rdev serve` consults the node's on-chain revoked set (refreshed periodically) and
 //! denies revoked chains; `spawn` is gated by a `$RDEV_SPAWN_ALLOW` allowlist (default-deny) with a
 //! scrubbed environment. The inbox is polled.
 
@@ -477,15 +480,72 @@ fn write_example_config() -> Result<()> {
 
 /// Resolve `target` (alias or 64-hex node id) + optional `--cap` to (node_id, cap_token).
 fn resolve(cfg: &Config, target: &str, cli_cap: Option<String>) -> Result<(String, String)> {
-    let (node_id, cap) = if is_hex64(target) {
-        (target.to_string(), cli_cap)
+    // Resolve the node id + an optional cap from rdev's own config (back-compat).
+    let (node_id, cfg_cap) = if is_hex64(target) {
+        (target.to_string(), None)
     } else if let Some(a) = cfg.alias.get(target) {
-        (a.node_id.clone(), cli_cap.or_else(|| a.cap.clone()))
+        (a.node_id.clone(), a.cap.clone())
+    } else if let Some((nid, cap)) = ce_wallet_lookup(target) {
+        // `target` is an alias in the SHARED ce wallet (the one auth store).
+        (nid, Some(cap))
     } else {
-        return Err(anyhow!("unknown target '{target}' (not 64-hex, not a config alias)"));
+        return Err(anyhow!(
+            "unknown target '{target}' (not 64-hex, not an rdev alias, not a ce-wallet alias)"
+        ));
     };
-    let cap = cap.ok_or_else(|| anyhow!("no capability for '{target}' — set `cap` in the alias or pass --cap"))?;
+    // Capability precedence: explicit --cap  >  rdev config alias  >  the SHARED ce node wallet.
+    // rdev no longer keeps its own cap store — a capability you hold in the ce wallet works here with
+    // no --cap (PLAN/ce-iam-store-unification.md: one wallet for every app).
+    let cap = cli_cap
+        .or(cfg_cap)
+        .or_else(|| ce_wallet_lookup(&node_id).map(|(_, c)| c))
+        .ok_or_else(|| {
+            anyhow!("no capability for '{target}' — hold one in the shared ce wallet (`ce wallet add \
+                     <alias> <node-id> --cap <token>`) or pass --cap")
+        })?;
     Ok((node_id, cap))
+}
+
+/// The ce node data dir (`$CE_DATA_DIR`, else the platform default: `~/Library/Application Support/ce`
+/// on macOS, `~/.local/share/ce` on Linux) — the home of the ONE shared wallet + roots file.
+fn ce_data_dir() -> PathBuf {
+    if let Ok(d) = std::env::var("CE_DATA_DIR") {
+        if !d.trim().is_empty() {
+            return PathBuf::from(d);
+        }
+    }
+    dirs_next::data_dir().unwrap_or_else(|| PathBuf::from(".")).join("ce")
+}
+
+/// Look up a held capability in the SHARED ce node wallet (`<ce-data-dir>/wallet.toml`), by alias
+/// name or by node id. This is the one enforced auth store — rdev reads it instead of a private copy.
+fn ce_wallet_lookup(alias_or_node_id: &str) -> Option<(String, String)> {
+    #[derive(Deserialize)]
+    struct W {
+        #[serde(default)]
+        entries: BTreeMap<String, E>,
+    }
+    #[derive(Deserialize)]
+    struct E {
+        node_id: String,
+        #[serde(default)]
+        cap: Option<String>,
+    }
+    let text = std::fs::read_to_string(ce_data_dir().join("wallet.toml")).ok()?;
+    let w: W = toml::from_str(&text).ok()?;
+    if let Some(e) = w.entries.get(alias_or_node_id) {
+        if let Some(c) = &e.cap {
+            return Some((e.node_id.clone(), c.clone()));
+        }
+    }
+    for e in w.entries.values() {
+        if e.node_id.eq_ignore_ascii_case(alias_or_node_id) {
+            if let Some(c) = &e.cap {
+                return Some((e.node_id.clone(), c.clone()));
+            }
+        }
+    }
+    None
 }
 
 fn is_hex64(s: &str) -> bool {
