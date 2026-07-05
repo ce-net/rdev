@@ -18,6 +18,7 @@ path = "src/main.rs"
 
 [dependencies]
 ce-rs = { git = "https://github.com/ce-net/ce-rs" }         # mesh transport (AppRequest/reply) + status
+ce-wallet = { git = "https://github.com/ce-net/ce" }             # the ONE wallet/roots schema
 ce-cap = { git = "https://github.com/ce-net/ce" }            # the capability verifier primitive
 ce-container = { git = "https://github.com/ce-net/ce" }      # the run-a-container primitive (bollard/gVisor)
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }

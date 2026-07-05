@@ -518,34 +518,10 @@ fn ce_data_dir() -> PathBuf {
 }
 
 /// Look up a held capability in the SHARED ce node wallet (`<ce-data-dir>/wallet.toml`), by alias
-/// name or by node id. This is the one enforced auth store — rdev reads it instead of a private copy.
+/// name or by node id. Uses the `ce-wallet` crate — the ONE schema every app links — so rdev, ce, and
+/// ce-iam read byte-identical entries with no private copy.
 fn ce_wallet_lookup(alias_or_node_id: &str) -> Option<(String, String)> {
-    #[derive(Deserialize)]
-    struct W {
-        #[serde(default)]
-        entries: BTreeMap<String, E>,
-    }
-    #[derive(Deserialize)]
-    struct E {
-        node_id: String,
-        #[serde(default)]
-        cap: Option<String>,
-    }
-    let text = std::fs::read_to_string(ce_data_dir().join("wallet.toml")).ok()?;
-    let w: W = toml::from_str(&text).ok()?;
-    if let Some(e) = w.entries.get(alias_or_node_id) {
-        if let Some(c) = &e.cap {
-            return Some((e.node_id.clone(), c.clone()));
-        }
-    }
-    for e in w.entries.values() {
-        if e.node_id.eq_ignore_ascii_case(alias_or_node_id) {
-            if let Some(c) = &e.cap {
-                return Some((e.node_id.clone(), c.clone()));
-            }
-        }
-    }
-    None
+    ce_wallet::Wallet::open(&ce_data_dir()).ok()?.cap_for(alias_or_node_id)
 }
 
 fn is_hex64(s: &str) -> bool {
