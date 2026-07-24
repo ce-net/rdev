@@ -586,6 +586,7 @@ dependencies = [
 [[package]]
 name = "ce-appmgr"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "directories",
@@ -595,6 +596,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tar",
  "toml",
  "tracing",
 ]
@@ -602,6 +604,7 @@ dependencies = [
 [[package]]
 name = "ce-cap"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "bincode",
@@ -614,6 +617,7 @@ dependencies = [
 [[package]]
 name = "ce-chain"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "bincode",
@@ -629,6 +633,7 @@ dependencies = [
 [[package]]
 name = "ce-container"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -646,16 +651,23 @@ dependencies = [
 [[package]]
 name = "ce-guard"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "async-trait",
+ "bincode",
  "ce-identity",
+ "hex",
  "serde",
+ "serde_json",
+ "toml",
+ "tracing",
 ]
 
 [[package]]
 name = "ce-identity"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -666,8 +678,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ce-lane"
+version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "libc",
+ "nix",
+ "serde",
+]
+
+[[package]]
 name = "ce-mesh"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -675,6 +700,7 @@ dependencies = [
  "ce-chain",
  "ce-identity",
  "ce-protocol",
+ "ce-reqresp",
  "futures",
  "libp2p",
  "libp2p-stream",
@@ -687,6 +713,7 @@ dependencies = [
 [[package]]
 name = "ce-microvm"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -699,6 +726,7 @@ dependencies = [
 [[package]]
 name = "ce-node"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "axum",
@@ -710,6 +738,7 @@ dependencies = [
  "ce-container",
  "ce-guard",
  "ce-identity",
+ "ce-lane",
  "ce-mesh",
  "ce-microvm",
  "ce-protocol",
@@ -735,6 +764,7 @@ dependencies = [
 [[package]]
 name = "ce-protocol"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "bincode",
@@ -745,12 +775,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "ce-reqresp"
+version = "0.26.3"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
+dependencies = [
+ "async-trait",
+ "futures",
+ "futures-bounded",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-swarm",
+ "smallvec",
+ "tracing",
+ "void",
+]
+
+[[package]]
 name = "ce-rs"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce-rs#8386f4fa26462ca7926af688ff4aeb08eebe0a72"
 dependencies = [
  "anyhow",
  "bytes",
+ "ce-lane",
  "directories",
+ "futures-channel",
  "futures-core",
  "futures-util",
  "hex",
@@ -763,6 +812,7 @@ dependencies = [
 [[package]]
 name = "ce-runtime"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -772,6 +822,7 @@ dependencies = [
 [[package]]
 name = "ce-tls"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "rcgen",
@@ -779,8 +830,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ce-wallet"
+version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
+dependencies = [
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "ce-wasm"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2532,7 +2593,6 @@ dependencies = [
  "libp2p-ping",
  "libp2p-quic",
  "libp2p-relay",
- "libp2p-request-response",
  "libp2p-swarm",
  "libp2p-tcp",
  "libp2p-upnp",
@@ -3171,6 +3231,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3334,6 +3403,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -3958,6 +4028,7 @@ dependencies = [
  "ce-identity",
  "ce-node",
  "ce-rs",
+ "ce-wallet",
  "clap",
  "diffy",
  "dirs-next",
@@ -4669,6 +4740,17 @@ checksum = "8e1d1b10ced5ca923a1fcb8d03e96b8d3268065d724548c0211415ff6ac6bac4"
 dependencies = [
  "core-foundation-sys",
  "libc",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
 ]
 
 [[package]]
@@ -5965,6 +6047,16 @@ dependencies = [
  "rusticata-macros",
  "thiserror 1.0.69",
  "time",
+]
+
+[[package]]
+name = "xattr"
+version = "1.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
+dependencies = [
+ "libc",
+ "rustix",
 ]
 
 [[package]]
