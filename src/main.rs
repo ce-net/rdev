@@ -1284,6 +1284,23 @@ async fn serve(client: &CeClient) -> Result<()> {
     // a seed can delegate attenuated caps down a replication tree that every node accepts.
     let roots = load_roots();
     let host_short = host_hex[..16].to_string();
+    // SAY IT LOUDLY WHEN NOTHING CAN RUN. The allowlist is default-deny, which is right -- a holder
+    // of a valid spawn cap should only reach programs the operator opted into. But an EMPTY one
+    // means every `rdev run` is refused, and the refusal arrives at the caller, hours later and a
+    // network away, as "run denied: no programs allow-listed".
+    //
+    // That is how the relay was locked out tonight. An older build carried a built-in default list,
+    // this one does not, and the systemd unit never set the variable -- so a routine binary upgrade
+    // left a healthy, "active", perfectly reachable service that refused every command. A service
+    // that cannot do its job must say so at startup, where the operator is looking, not only in the
+    // reply to whoever finally tries.
+    if spawn_allowlist().is_empty() {
+        eprintln!(
+            "rdev serve: WARNING — RDEV_SPAWN_ALLOW is empty, so `rdev run`/`spawn` will refuse \
+             EVERY command. Set it (systemd drop-in: Environment=RDEV_SPAWN_ALLOW=bash,sh,cargo,\
+             git,ce,rdev,python3) or this node is reachable but unusable."
+        );
+    }
     println!(
         "rdev serving as {}… (rdev/exec, rdev/spawn, rdev/run/* — file transfer sync/sync2/gitsync DISABLED) — {} configured root(s)",
         host_short,
