@@ -597,7 +597,31 @@ async fn run(
     if !r.ok {
         return Err(anyhow!("run refused: {}", r.error.unwrap_or_default()));
     }
-    let job_id = r.job_id.ok_or_else(|| anyhow!("server did not return a job_id"))?;
+    // No job id means the target ran the command DISKLESS: its disk was too full to hold a job dir
+    // even after reclaiming, so there is no log to poll and the whole result is already in this
+    // reply. Print it and finish rather than demanding a job id the target could not create — that
+    // demand is what used to leave a full device unreachable.
+    let job_id = match r.job_id {
+        Some(id) => id,
+        None => {
+            if let Some(why) = &r.error {
+                eprintln!("rdev: {why}");
+            }
+            use std::io::Write;
+            if let Some(out) = &r.stdout {
+                print!("{out}");
+                let _ = std::io::stdout().flush();
+            }
+            if let Some(err) = &r.stderr {
+                eprint!("{err}");
+            }
+            let code = r.exit_code.unwrap_or(0);
+            if code != 0 {
+                std::process::exit(code as i32);
+            }
+            return Ok(());
+        }
+    };
     eprintln!("rdev: job {job_id} started on {}…", &node_id[..node_id.len().min(16)]);
 
     // 2) poll logs until the job exits. Ctrl-C kills the remote job and exits.
@@ -1510,15 +1534,42 @@ fn run_start(req: &Req, chain: &[SignedCapability], home: &Path) -> Result<Resp>
     };
     std::fs::create_dir_all(&cwd).ok();
 
-    // Create the job dir.
+    // Trim BEFORE creating anything. This used to run immediately AFTER the create, which meant a
+    // node whose disk had filled — including filling it with rdev's own accumulated job dirs — got
+    // `create job dir …: No space left on device` and never reached the trim that would have made
+    // room. A full disk is exactly when remote access matters most, and ssh is not a fallback by
+    // directive, so the tool that reclaims space must never be the tool that needs space first.
+    trim_jobs(home, MAX_RETAINED_JOBS);
+
+    // Create the job dir, escalating through reclaim steps rather than failing.
     let job_id = new_job_id();
     let jdir = jobs_dir(home).join(&job_id);
-    std::fs::create_dir_all(&jdir).with_context(|| format!("create job dir {}", jdir.display()))?;
+    let mut disk_err: Option<String> = None;
+    if let Err(e) = std::fs::create_dir_all(&jdir) {
+        // Step 1: drop EVERY retained job dir, not just those past the cap.
+        trim_jobs(home, 0);
+        // Step 2: release the ballast — a reserved file that exists only to be deleted here, so
+        // there is always something left to free even when the disk filled for reasons that have
+        // nothing to do with rdev.
+        let released = release_ballast(home);
+        if let Err(e2) = std::fs::create_dir_all(&jdir) {
+            // Still no room. Fall through to a DISKLESS run below rather than leaving the device
+            // unreachable: output is captured in memory and returned inline. That is the whole
+            // guarantee — a device is never stale, whatever its disk is doing.
+            disk_err = Some(format!(
+                "job dir unavailable ({e2}; first attempt: {e}; ballast released: {released})"
+            ));
+        }
+    }
+    if let Some(why) = disk_err {
+        tracing::warn!("rdev run: {why} — running DISKLESS (output inline, no job id)");
+        return run_diskless(&cmd, &cwd, &why);
+    }
     let log_path = jdir.join("log");
     let status_path = jdir.join("status");
-
-    // Trim old jobs (best-effort) to bound disk use.
-    trim_jobs(home, MAX_RETAINED_JOBS);
+    // Re-arm the ballast for next time, now that we know there is room. Best-effort and silent:
+    // failing to reserve must never fail the job the operator actually asked for.
+    reserve_ballast(home);
 
     // Build the wrapper that runs the command, then records "$?" to the status file so run/logs can
     // report the exit code even after the process group is gone. The user command is passed as argv
@@ -1669,6 +1720,98 @@ fn shell_quote(s: &str) -> String {
 
 /// Trim the jobs directory to at most `max` job dirs, removing the oldest (by meta `started_ms`,
 /// falling back to dir mtime) first. Best-effort: errors are ignored.
+/// Bytes reserved purely so there is something to delete when the disk is full. Small enough to
+/// cost nothing, large enough to fit a job dir plus the first of its log output.
+const BALLAST_BYTES: u64 = 4 * 1024 * 1024;
+
+fn ballast_path(home: &Path) -> PathBuf {
+    jobs_dir(home).join(".ballast")
+}
+
+/// Reserve the ballast if it is missing. Best-effort: on a full disk this simply does not happen,
+/// which is fine — the point of the ballast is to have been reserved EARLIER, while there was room.
+fn reserve_ballast(home: &Path) {
+    let p = ballast_path(home);
+    if p.exists() {
+        return;
+    }
+    if let Ok(f) = std::fs::File::create(&p) {
+        // set_len is sparse on most filesystems, which would reserve nothing and make the ballast a
+        // lie. Write real bytes.
+        use std::io::Write;
+        let mut w = std::io::BufWriter::new(f);
+        let chunk = [0u8; 64 * 1024];
+        let mut left = BALLAST_BYTES;
+        while left > 0 {
+            let n = left.min(chunk.len() as u64) as usize;
+            if w.write_all(&chunk[..n]).is_err() {
+                break;
+            }
+            left -= n as u64;
+        }
+        let _ = w.flush();
+    }
+}
+
+/// Delete the ballast to make room. Returns whether there was one to release.
+fn release_ballast(home: &Path) -> bool {
+    let p = ballast_path(home);
+    if p.exists() {
+        return std::fs::remove_file(&p).is_ok();
+    }
+    false
+}
+
+/// Run a command with NO on-disk job state, capturing bounded output in memory.
+///
+/// This is the last rung of the ladder: the disk is full for reasons rdev cannot reclaim (someone
+/// else's 49 GB of build caches, say), so there is nowhere to put a log file. Refusing here is what
+/// makes a device permanently unmanageable, so instead the command runs synchronously and its output
+/// comes back in the reply. No `job_id` is returned, because there is nothing to follow up on — the
+/// caller gets the whole result at once.
+fn run_diskless(cmd: &[String], cwd: &Path, why: &str) -> Result<Resp> {
+    /// Bounded so a chatty command cannot exhaust memory on a node that is already in trouble.
+    const MAX_CAPTURE: usize = 256 * 1024;
+    let joined = cmd.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
+    let path_env = {
+        #[cfg(unix)]
+        let default_path = "/usr/bin:/bin";
+        #[cfg(windows)]
+        let default_path = "C:\\Windows\\System32;C:\\Windows";
+        std::env::var("PATH").unwrap_or_else(|_| default_path.to_string())
+    };
+    let mut command = std::process::Command::new("sh");
+    command
+        .arg("-c")
+        .arg(&joined)
+        .current_dir(cwd)
+        .env_clear()
+        .env("PATH", path_env)
+        .stdin(std::process::Stdio::null());
+    #[cfg(unix)]
+    command.env("HOME", cwd);
+    #[cfg(windows)]
+    command.env("USERPROFILE", cwd);
+    let out = command.output().with_context(|| format!("diskless run of '{}'", cmd[0]))?;
+    let clip = |b: &[u8]| {
+        let s = String::from_utf8_lossy(b);
+        if s.len() > MAX_CAPTURE {
+            format!("{}\n[truncated at {MAX_CAPTURE} bytes]", &s[..MAX_CAPTURE])
+        } else {
+            s.to_string()
+        }
+    };
+    Ok(Resp {
+        ok: true,
+        // Reported, not hidden: the caller must know it got a diskless run with no job id, and why.
+        error: Some(format!("ran DISKLESS — {why}")),
+        stdout: Some(clip(&out.stdout)),
+        stderr: Some(clip(&out.stderr)),
+        exit_code: Some(out.status.code().unwrap_or(-1) as i64),
+        job_id: None,
+    })
+}
+
 fn trim_jobs(home: &Path, max: usize) {
     let dir = jobs_dir(home);
     let Ok(rd) = std::fs::read_dir(&dir) else { return };
@@ -2911,6 +3054,66 @@ mod tests {
         let resp: Resp = serde_json::from_slice(&bytes).unwrap();
         assert!(!resp.ok);
         assert!(resp.error.unwrap_or_default().contains("denied"));
+    }
+
+    /// A device whose disk cannot hold a job dir must STILL run the command.
+    ///
+    /// Reproduces the relay incident of 2026-07-26: `/opt/build` held 49 GB of dormant cargo caches,
+    /// the disk hit 0 bytes, and every `rdev run` died with
+    /// `run refused: create job dir /root/.rdev/jobs/<id>` — so the one tool that could have deleted
+    /// those caches was the one tool that needed free space to start. ssh is not a fallback by
+    /// directive, which left the public bootstrap node unmanageable.
+    ///
+    /// A real ENOSPC is awkward to fake portably, so the job dir is made uncreatable instead: a
+    /// regular FILE sits where the jobs directory belongs, so `create_dir_all` fails for every
+    /// candidate path underneath it. Same code path, same failure to create, deterministic.
+    #[cfg(unix)]
+    #[test]
+    fn run_survives_an_unusable_job_dir() {
+        allow_spawn();
+        let home = tmp_home("run-nodisk");
+        let jobs = jobs_dir(&home);
+        let _ = std::fs::remove_dir_all(&jobs);
+        if let Some(parent) = jobs.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        // A file where the directory should be: nothing can be created inside it.
+        std::fs::write(&jobs, b"not a directory").unwrap();
+
+        let chain: Vec<SignedCapability> = vec![];
+        let req = Req {
+            cmd: Some(vec!["sh".into(), "-c".into(), "printf diskless-ok".into()]),
+            ..Default::default()
+        };
+        let resp = run_start(&req, &chain, &home).expect("a full disk must not refuse the command");
+        assert!(resp.ok, "run must succeed disklessly, got error: {:?}", resp.error);
+        assert!(
+            resp.job_id.is_none(),
+            "a diskless run has no job to follow up on, so it must not claim a job id"
+        );
+        assert_eq!(resp.stdout.as_deref(), Some("diskless-ok"), "output comes back inline");
+        assert_eq!(resp.exit_code, Some(0));
+        assert!(
+            resp.error.as_deref().unwrap_or_default().contains("DISKLESS"),
+            "the caller must be told it got a diskless run, not silently handed a different mode"
+        );
+    }
+
+    /// The ballast exists to be deleted when the disk is full, so it must actually occupy bytes —
+    /// a sparse reservation would free nothing and make the whole ladder a lie.
+    #[cfg(unix)]
+    #[test]
+    fn ballast_occupies_real_bytes_and_releases() {
+        let home = tmp_home("run-ballast");
+        let _ = std::fs::remove_dir_all(jobs_dir(&home));
+        std::fs::create_dir_all(jobs_dir(&home)).unwrap();
+        reserve_ballast(&home);
+        let p = ballast_path(&home);
+        let len = std::fs::metadata(&p).expect("ballast reserved").len();
+        assert_eq!(len, BALLAST_BYTES, "ballast must be fully written, not sparse");
+        assert!(release_ballast(&home), "release reports that it freed something");
+        assert!(!p.exists(), "ballast is gone after release");
+        assert!(!release_ballast(&home), "releasing twice frees nothing and says so");
     }
 
     #[cfg(unix)]
