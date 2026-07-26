@@ -586,9 +586,9 @@ dependencies = [
 [[package]]
 name = "ce-appmgr"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
+ "ce-cap",
  "directories",
  "hex",
  "reqwest",
@@ -602,43 +602,33 @@ dependencies = [
 ]
 
 [[package]]
-name = "ce-cap"
+name = "ce-blob"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
- "anyhow",
- "bincode",
- "ce-identity",
  "hex",
  "serde",
  "sha2",
 ]
 
 [[package]]
-name = "ce-chain"
+name = "ce-cap"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "bincode",
  "ce-identity",
  "hex",
  "serde",
- "serde_json",
  "sha2",
- "tracing",
- "zstd",
 ]
 
 [[package]]
 name = "ce-container"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "async-trait",
  "bollard",
- "ce-chain",
  "ce-identity",
  "ce-runtime",
  "futures",
@@ -651,7 +641,6 @@ dependencies = [
 [[package]]
 name = "ce-guard"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -667,7 +656,6 @@ dependencies = [
 [[package]]
 name = "ce-identity"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -680,7 +668,6 @@ dependencies = [
 [[package]]
 name = "ce-lane"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "bincode",
@@ -692,12 +679,10 @@ dependencies = [
 [[package]]
 name = "ce-mesh"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "async-trait",
  "bincode",
- "ce-chain",
  "ce-identity",
  "ce-protocol",
  "ce-reqresp",
@@ -713,7 +698,6 @@ dependencies = [
 [[package]]
 name = "ce-microvm"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -726,15 +710,14 @@ dependencies = [
 [[package]]
 name = "ce-node"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "axum",
  "bincode",
  "bollard",
  "ce-appmgr",
+ "ce-blob",
  "ce-cap",
- "ce-chain",
  "ce-container",
  "ce-guard",
  "ce-identity",
@@ -750,6 +733,7 @@ dependencies = [
  "futures",
  "hex",
  "hyper-util",
+ "rlimit",
  "serde",
  "serde_json",
  "sha2",
@@ -764,7 +748,6 @@ dependencies = [
 [[package]]
 name = "ce-protocol"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "bincode",
@@ -777,7 +760,6 @@ dependencies = [
 [[package]]
 name = "ce-reqresp"
 version = "0.26.3"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "async-trait",
  "futures",
@@ -793,7 +775,6 @@ dependencies = [
 [[package]]
 name = "ce-rs"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce-rs#8386f4fa26462ca7926af688ff4aeb08eebe0a72"
 dependencies = [
  "anyhow",
  "bytes",
@@ -812,7 +793,6 @@ dependencies = [
 [[package]]
 name = "ce-runtime"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -822,7 +802,6 @@ dependencies = [
 [[package]]
 name = "ce-tls"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "rcgen",
@@ -832,7 +811,6 @@ dependencies = [
 [[package]]
 name = "ce-wallet"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "serde",
  "toml",
@@ -841,7 +819,6 @@ dependencies = [
 [[package]]
 name = "ce-wasm"
 version = "0.1.0"
-source = "git+https://github.com/ce-net/ce#21ce4f28f02532856253ecf5f9f309bfbd0debe3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4209,6 +4186,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rlimit"
+version = "0.10.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7043b63bd0cd1aaa628e476b80e6d4023a3b50eb32789f2728908107bd0c793a"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "rtnetlink"
 version = "0.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6236,31 +6222,3 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
-
-[[package]]
-name = "zstd"
-version = "0.13.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e91ee311a569c327171651566e07972200e76fcfe2242a4fa446149a3881c08a"
-dependencies = [
- "zstd-safe",
-]
-
-[[package]]
-name = "zstd-safe"
-version = "7.2.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8f49c4d5f0abb602a93fb8736af2a4f4dd9512e36f7f570d66e65ff867ed3b9d"
-dependencies = [
- "zstd-sys",
-]
-
-[[package]]
-name = "zstd-sys"
-version = "2.0.16+zstd.1.5.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91e19ebc2adc8f83e43039e79776e3fda8ca919132d68a1fed6a5faca2683748"
-dependencies = [
- "cc",
- "pkg-config",
-]
