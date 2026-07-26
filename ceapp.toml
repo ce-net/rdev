@@ -31,6 +31,15 @@ tier       = "none"        # explicit + audited; the host-access case
 net        = "loopback"    # mesh transport via the local node (127.0.0.1:8844)
 capability = "inherit"     # reuses the node wallet/caps for outbound; inbound is ce-cap-gated
 
+[env]
+# WITHOUT THIS, EVERY COMMAND IS REFUSED. The program allowlist is default-deny by design, but an
+# EMPTY one means a serve that is healthy, reachable and useless -- which is how the relay was
+# locked out after a routine binary upgrade: the systemd unit that ran it had never set the
+# variable, because an older build carried a built-in default. Declaring it here means installing
+# rdev gets you a WORKING rdev, instead of one that needs a drop-in nobody remembers.
+# The process environment still wins, so an operator narrowing it is respected.
+RDEV_SPAWN_ALLOW = "bash,sh,cargo,git,ce,rdev,python3"
+
 [daemon]
 # `rdev serve` accepts inbound rdev requests (exec/spawn/run). FILE TRANSFER IS DISABLED as of
 # 0.2.1 (2026-07-02, Leif's order): the sync/sync2 apply surface and the gitsync auto-run are
