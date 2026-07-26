@@ -586,6 +586,7 @@ dependencies = [
 [[package]]
 name = "ce-appmgr"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "anyhow",
  "ce-cap",
@@ -604,6 +605,7 @@ dependencies = [
 [[package]]
 name = "ce-blob"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "hex",
  "serde",
@@ -613,6 +615,7 @@ dependencies = [
 [[package]]
 name = "ce-cap"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "anyhow",
  "bincode",
@@ -625,6 +628,7 @@ dependencies = [
 [[package]]
 name = "ce-container"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -641,6 +645,7 @@ dependencies = [
 [[package]]
 name = "ce-guard"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -656,6 +661,7 @@ dependencies = [
 [[package]]
 name = "ce-identity"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -668,6 +674,7 @@ dependencies = [
 [[package]]
 name = "ce-lane"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "anyhow",
  "bincode",
@@ -679,6 +686,7 @@ dependencies = [
 [[package]]
 name = "ce-mesh"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -698,6 +706,7 @@ dependencies = [
 [[package]]
 name = "ce-microvm"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -710,6 +719,7 @@ dependencies = [
 [[package]]
 name = "ce-node"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "anyhow",
  "axum",
@@ -748,6 +758,7 @@ dependencies = [
 [[package]]
 name = "ce-protocol"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "anyhow",
  "bincode",
@@ -760,6 +771,7 @@ dependencies = [
 [[package]]
 name = "ce-reqresp"
 version = "0.26.3"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "async-trait",
  "futures",
@@ -775,6 +787,7 @@ dependencies = [
 [[package]]
 name = "ce-rs"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce-rs#000d3dc18c7274cfeb4b5366298ac7b46a273292"
 dependencies = [
  "anyhow",
  "bytes",
@@ -793,6 +806,7 @@ dependencies = [
 [[package]]
 name = "ce-runtime"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -802,6 +816,7 @@ dependencies = [
 [[package]]
 name = "ce-tls"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "anyhow",
  "rcgen",
@@ -811,6 +826,7 @@ dependencies = [
 [[package]]
 name = "ce-wallet"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "serde",
  "toml",
@@ -819,6 +835,7 @@ dependencies = [
 [[package]]
 name = "ce-wasm"
 version = "0.1.0"
+source = "git+https://github.com/ce-net/ce#701f07f321221b78ea8a99ab2c2b5b07f55fc060"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2145,7 +2162,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "system-configuration",
  "tokio",
  "tower-service",
@@ -3842,7 +3859,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -3879,7 +3896,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.4",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.59.0",
 ]
@@ -4752,10 +4769,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
