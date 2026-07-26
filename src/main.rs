@@ -1562,7 +1562,7 @@ fn run_start(req: &Req, chain: &[SignedCapability], home: &Path) -> Result<Resp>
         }
     }
     if let Some(why) = disk_err {
-        tracing::warn!("rdev run: {why} — running DISKLESS (output inline, no job id)");
+        eprintln!("rdev run: {why} — running DISKLESS (output inline, no job id)");
         return run_diskless(&cmd, &cwd, &why);
     }
     let log_path = jdir.join("log");
